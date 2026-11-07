@@ -127,6 +127,10 @@ export interface MediaAsset {
   audioStats?: AudioLevelStats;
   /** Error message if audio track decoding failed */
   audioDecodeError?: string;
+  /** true while background audio analysis is running (video is already usable) */
+  audioAnalyzing?: boolean;
+  /** 0..1 background analysis progress */
+  audioAnalysisProgress?: number;
   missingFile?: boolean; // true when loaded from a lightweight .zip pack before video re-link
 }
 

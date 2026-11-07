@@ -77,14 +77,23 @@ function checkAudioBufferHasSignal(buffer: AudioBuffer): {
   };
 }
 
+/** Low sample-rate used for waveform analysis (8kHz = ~1/6 memory of 48kHz) */
+const ANALYSIS_SAMPLE_RATE = 8000;
+/** Above this size, skip arrayBuffer()-based decoding and scan via <video> element instead */
+const MAX_DECODE_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
+
 /**
- * Robust multi-stage audio decoder for both short and long-form (10+ min) videos.
- * - Stage 1: OfflineAudioContext (2ch, 16kHz) — decodes purely in software without hardware AudioContext limits.
- * - Stage 2: Standard native-sample-rate AudioContext (most compatible across Chrome/Safari/Edge for AAC/MP4/MOV).
- * - Stage 3: OfflineAudioContext (1ch, 8kHz) — ultra-low memory footprint fallback for very long videos.
- * - Never returns dummy zero arrays: throws an explicit Error if decoding fails or if the audio stream is empty.
+ * Lightweight, memory-safe audio decoder (8kHz by default).
+ * - Stage 1: AudioContext({ sampleRate }) decodeAudioData
+ * - Stage 2: OfflineAudioContext(1ch, sampleRate) decodeAudioData
+ * - Stage 3: native-rate AudioContext decodeAudioData
+ * The file is re-read for each stage because decodeAudioData detaches the ArrayBuffer.
+ * Throws if every stage fails (callers fall back to the media-element scan).
  */
-async function decodeAudioBufferRobust(file: File | Blob): Promise<AudioBuffer> {
+async function decodeAudioBufferRobust(
+  file: File | Blob,
+  sampleRate = ANALYSIS_SAMPLE_RATE
+): Promise<AudioBuffer> {
   const AudioCtx =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -97,56 +106,50 @@ async function decodeAudioBufferRobust(file: File | Blob): Promise<AudioBuffer> 
       }
     ).webkitOfflineAudioContext;
 
-  const rawArrayBuffer = await file.arrayBuffer();
-  if (!rawArrayBuffer || rawArrayBuffer.byteLength === 0) {
+  if (file.size === 0) {
     throw new Error('ファイルデータが空です。');
+  }
+  if (file.size > MAX_DECODE_FILE_BYTES) {
+    throw new Error('ファイルが大きすぎるため直接デコードをスキップします。');
   }
 
   let lastError: unknown = null;
 
-  // Stage 1: OfflineAudioContext (2ch, 16kHz) - avoids hardware audio device limits & keeps memory low on 10+ min videos
-  if (OfflineCtx) {
-    try {
-      const offline16k = new OfflineCtx(2, 1, 16000);
-      const buffer = await offline16k.decodeAudioData(rawArrayBuffer.slice(0));
-      const check = checkAudioBufferHasSignal(buffer);
-      if (check.hasSignal) {
-        return buffer;
-      }
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  // Stage 2: Standard native-sample-rate AudioContext
+  const attempts: Array<() => Promise<AudioBuffer>> = [];
   if (AudioCtx) {
-    try {
-      const nativeCtx = new AudioCtx();
+    attempts.push(async () => {
+      const ctx = new AudioCtx({ sampleRate });
       try {
-        const buffer = await nativeCtx.decodeAudioData(rawArrayBuffer.slice(0));
-        const check = checkAudioBufferHasSignal(buffer);
-        await nativeCtx.close().catch(() => {});
-        if (check.hasSignal) {
-          return buffer;
-        }
-      } catch (err) {
-        lastError = err;
-        await nativeCtx.close().catch(() => {});
+        return await ctx.decodeAudioData(await file.arrayBuffer());
+      } finally {
+        await ctx.close().catch(() => {});
       }
-    } catch (err) {
-      lastError = err;
-    }
+    });
+  }
+  if (OfflineCtx) {
+    attempts.push(async () => {
+      const ctx = new OfflineCtx(1, 1, sampleRate);
+      return await ctx.decodeAudioData(await file.arrayBuffer());
+    });
+  }
+  if (AudioCtx) {
+    attempts.push(async () => {
+      const ctx = new AudioCtx();
+      try {
+        return await ctx.decodeAudioData(await file.arrayBuffer());
+      } finally {
+        await ctx.close().catch(() => {});
+      }
+    });
   }
 
-  // Stage 3: Ultra-lightweight OfflineAudioContext (1ch, 8kHz) for memory-constrained environments
-  if (OfflineCtx) {
+  for (const attempt of attempts) {
     try {
-      const offline8k = new OfflineCtx(1, 1, 8000);
-      const buffer = await offline8k.decodeAudioData(rawArrayBuffer.slice(0));
-      const check = checkAudioBufferHasSignal(buffer);
-      if (check.hasSignal) {
+      const buffer = await attempt();
+      if (checkAudioBufferHasSignal(buffer).hasSignal) {
         return buffer;
       }
+      lastError = new Error('デコード結果の信号がすべて 0 でした');
     } catch (err) {
       lastError = err;
     }
@@ -154,46 +157,125 @@ async function decodeAudioBufferRobust(file: File | Blob): Promise<AudioBuffer> 
 
   const errDetail =
     lastError instanceof Error ? ` (${lastError.message})` : '';
-  throw new Error(
-    `動画から有効な音声データをデコードできませんでした${errDetail}。音声トラックが含まれているか、対応コーデック（AAC/PCM/MP3/Opus）であるか確認してください。`
-  );
+  throw new Error(`音声データをデコードできませんでした${errDetail}`);
 }
 
 /**
- * Extract high-precision multi-channel RMS waveform peaks + Peak Normalization (Auto-Gain)
- * + Audio Level Statistics (Max dB, Speech 95th-percentile dB, Mean dB, Noise Floor dB).
- * Never returns dummy zero arrays on error — throws a descriptive error instead.
+ * Fallback: scan real loudness via <video> element + MediaElementAudioSourceNode + AnalyserNode.
+ * Plays the file silently (the source is NOT connected to the speakers) at 4x speed and
+ * records per-window RMS. Needs no arrayBuffer(), so it works for any size/codec the browser can play.
  */
-export async function extractWaveformPeaks(
+async function scanAudioLevelsViaMediaElement(
   file: File | Blob,
-  peaksPerSecond = 50
-): Promise<{
-  peaks: number[];
-  rawRms: number[];
-  duration: number;
-  sampleRate: number;
-  audioBuffer: AudioBuffer;
-  audioStats: AudioLevelStats;
-}> {
-  const audioBuffer = await decodeAudioBufferRobust(file);
+  peaksPerSecond: number,
+  onProgress?: (ratio: number) => void
+): Promise<{ rawRms: number[]; duration: number; maxSamplePeak: number }> {
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext })
+      .webkitAudioContext;
+  if (!AudioCtx) {
+    throw new Error('このブラウザは Web Audio API に対応していません。');
+  }
+
+  const url = URL.createObjectURL(file);
+  const el = document.createElement('video');
+  el.preload = 'auto';
+  el.src = url;
+  el.playsInline = true;
+
+  const ctx = new AudioCtx();
+  let timer: number | null = null;
+
+  const cleanup = () => {
+    if (timer !== null) window.clearInterval(timer);
+    try {
+      el.pause();
+    } catch {
+      /* ignore */
+    }
+    el.removeAttribute('src');
+    el.load();
+    ctx.close().catch(() => {});
+    URL.revokeObjectURL(url);
+  };
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      el.onloadedmetadata = () => resolve();
+      el.onerror = () => reject(new Error('メディアを読み込めませんでした'));
+    });
+
+    const duration = Number.isFinite(el.duration) ? el.duration : 0;
+    if (duration <= 0) {
+      throw new Error('動画の長さを取得できませんでした');
+    }
+
+    const totalWindows = Math.max(1, Math.ceil(duration * peaksPerSecond));
+    const rawRms = new Array<number>(totalWindows).fill(0);
+    let maxSamplePeak = 0;
+
+    const source = ctx.createMediaElementSource(el);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser); // intentionally not connected to destination (silent)
+    const data = new Float32Array(analyser.fftSize);
+
+    await ctx.resume();
+    el.playbackRate = 4;
+    await el.play();
+
+    await new Promise<void>((resolve, reject) => {
+      let lastBin = 0;
+      const sample = () => {
+        analyser.getFloatTimeDomainData(data);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) {
+          const a = Math.abs(data[i]);
+          if (a > maxSamplePeak) maxSamplePeak = a;
+          sumSq += a * a;
+        }
+        const rms = Math.sqrt(sumSq / data.length);
+        const bin = Math.min(
+          totalWindows - 1,
+          Math.floor(el.currentTime * peaksPerSecond)
+        );
+        for (let b = Math.min(lastBin, bin); b <= bin; b++) {
+          if (rms > rawRms[b]) rawRms[b] = rms;
+        }
+        lastBin = bin;
+        onProgress?.(Math.min(1, el.currentTime / duration));
+      };
+      timer = window.setInterval(sample, 20);
+      el.onended = () => resolve();
+      el.onerror = () => reject(new Error('再生スキャン中にエラーが発生しました'));
+    });
+
+    return { rawRms, duration, maxSamplePeak };
+  } finally {
+    cleanup();
+  }
+}
+
+/** Compute per-window RMS (max amplitude across ALL channels at each sample) from an AudioBuffer */
+function rmsWindowsFromBuffer(
+  audioBuffer: AudioBuffer,
+  peaksPerSecond: number
+): { rawRms: number[]; maxSamplePeak: number } {
   const duration = audioBuffer.duration;
   const numChannels = audioBuffer.numberOfChannels;
   const totalSamples = audioBuffer.length;
   const totalWindows = Math.max(1, Math.ceil(duration * peaksPerSecond));
   const samplesPerWindow = Math.max(1, Math.floor(totalSamples / totalWindows));
 
-  // Gather all channel Float32Arrays (handles Mono, Stereo, and Multi-channel 4ch/6ch OBS/Camera tracks)
   const channels: Float32Array[] = [];
   for (let ch = 0; ch < numChannels; ch++) {
     channels.push(audioBuffer.getChannelData(ch));
   }
 
   const rawRms: number[] = new Array(totalWindows);
-  let globalMaxSamplePeak = 0;
-  let globalMaxWindowRms = 0;
-  let sumAllRms = 0;
+  let maxSamplePeak = 0;
 
-  // Scan every sample across all channels (no coarse sample skipping)
   for (let w = 0; w < totalWindows; w++) {
     const startIdx = w * samplesPerWindow;
     const endIdx =
@@ -201,111 +283,151 @@ export async function extractWaveformPeaks(
         ? totalSamples
         : Math.min(totalSamples, startIdx + samplesPerWindow);
     const count = Math.max(1, endIdx - startIdx);
-
     let sumSquares = 0;
 
-    if (numChannels === 1) {
-      const ch0 = channels[0];
-      for (let j = startIdx; j < endIdx; j++) {
-        const abs = Math.abs(ch0[j]);
-        if (abs > globalMaxSamplePeak) globalMaxSamplePeak = abs;
-        sumSquares += abs * abs;
+    for (let j = startIdx; j < endIdx; j++) {
+      let maxCh = 0;
+      for (let c = 0; c < numChannels; c++) {
+        const abs = Math.abs(channels[c][j]);
+        if (abs > maxCh) maxCh = abs;
       }
-    } else if (numChannels === 2) {
-      const ch0 = channels[0];
-      const ch1 = channels[1];
-      for (let j = startIdx; j < endIdx; j++) {
-        const a0 = Math.abs(ch0[j]);
-        const a1 = Math.abs(ch1[j]);
-        // Use max amplitude across channels so single-ear/L-only/R-only mic recordings are never halved
-        const maxCh = a0 > a1 ? a0 : a1;
-        if (maxCh > globalMaxSamplePeak) globalMaxSamplePeak = maxCh;
-        sumSquares += maxCh * maxCh;
-      }
-    } else {
-      for (let j = startIdx; j < endIdx; j++) {
-        let maxCh = 0;
-        for (let c = 0; c < numChannels; c++) {
-          const abs = Math.abs(channels[c][j]);
-          if (abs > maxCh) maxCh = abs;
-        }
-        if (maxCh > globalMaxSamplePeak) globalMaxSamplePeak = maxCh;
-        sumSquares += maxCh * maxCh;
-      }
+      if (maxCh > maxSamplePeak) maxSamplePeak = maxCh;
+      sumSquares += maxCh * maxCh;
     }
-
-    const rms = Math.sqrt(sumSquares / count);
-    rawRms[w] = Number(rms.toFixed(6));
-    if (rms > globalMaxWindowRms) {
-      globalMaxWindowRms = rms;
-    }
-    sumAllRms += rms;
+    rawRms[w] = Number(Math.sqrt(sumSquares / count).toFixed(6));
   }
 
-  if (globalMaxSamplePeak <= 1e-5 || globalMaxWindowRms <= 1e-6) {
+  return { rawRms, maxSamplePeak };
+}
+
+/**
+ * Build normalized peaks (relative dB, speech reference = 0 dB) and level statistics.
+ * Throws if the signal is entirely zero.
+ */
+function buildWaveformAnalysis(
+  rawRms: number[],
+  maxSamplePeak: number
+): { peaks: number[]; audioStats: AudioLevelStats } {
+  const totalWindows = rawRms.length;
+  let globalMaxWindowRms = 0;
+  let sumAllRms = 0;
+  for (const r of rawRms) {
+    if (r > globalMaxWindowRms) globalMaxWindowRms = r;
+    sumAllRms += r;
+  }
+
+  if (maxSamplePeak <= 1e-5 || globalMaxWindowRms <= 1e-6) {
     throw new Error(
       '音声トラックの信号レベルが完全にゼロ（無音）です。動画に音声が入っているか確認してください。'
     );
   }
 
-  // Compute percentiles of window RMS for robust Auto-Gain Normalization & Noise Floor estimation
   const sortedRms = [...rawRms].sort((a, b) => a - b);
-  const p98Rms =
-    sortedRms[Math.min(sortedRms.length - 1, Math.floor(sortedRms.length * 0.98))] ||
-    globalMaxWindowRms;
-  const p95Rms =
-    sortedRms[Math.min(sortedRms.length - 1, Math.floor(sortedRms.length * 0.95))] ||
-    globalMaxWindowRms;
-  const p15Rms =
-    sortedRms[Math.floor(sortedRms.length * 0.15)] || 1e-6;
+  const pick = (q: number) =>
+    sortedRms[Math.min(sortedRms.length - 1, Math.floor(sortedRms.length * q))];
+  const p98Rms = pick(0.98) || globalMaxWindowRms;
+  const p95Rms = pick(0.95) || globalMaxWindowRms;
+  const p15Rms = pick(0.15) || 1e-6;
   const meanRms = sumAllRms / totalWindows;
 
-  // Reference level for normalization: 98th percentile RMS (prevents a single 1ms mic pop from making all speech tiny)
+  // 98th percentile window RMS = 0 dB (a single mic pop must not make all speech look tiny)
   const normReferenceRms = Math.max(p98Rms, globalMaxWindowRms * 0.5, 1e-5);
   const appliedGainLinear = 1.0 / normReferenceRms;
   const appliedGainDb = Number((20 * Math.log10(appliedGainLinear)).toFixed(1));
 
-  // Normalize waveformPeaks to [0..1] relative to normReferenceRms
-  const normalizedPeaks: number[] = new Array(totalWindows);
+  const peaks: number[] = new Array(totalWindows);
   for (let w = 0; w < totalWindows; w++) {
-    const normVal = Math.min(1.0, rawRms[w] * appliedGainLinear);
-    normalizedPeaks[w] = Number(normVal.toFixed(5));
+    peaks[w] = Number(Math.min(1.0, rawRms[w] * appliedGainLinear).toFixed(5));
   }
 
   const toDb = (amp: number) =>
     Number((20 * Math.log10(Math.max(amp, 1e-5))).toFixed(1));
 
-  const rawPeakDb = toDb(globalMaxSamplePeak);
-  const rawSpeechRmsDb = toDb(p95Rms);
-  const rawMeanDb = toDb(meanRms);
-
-  // Noise floor in normalized dB scale (where speech p98 = 0 dB)
-  const normNoiseFloorLinear = Math.min(1.0, p15Rms * appliedGainLinear);
-  const noiseFloorDb = toDb(normNoiseFloorLinear);
-
-  // Suggest a threshold safely between the normalized speech (-3dB) and noise floor
-  // e.g. if noise floor is -48dB, suggest around -30dB; if noise floor is -26dB, suggest -20dB
+  const noiseFloorDb = toDb(Math.min(1.0, p15Rms * appliedGainLinear));
   const suggestedThresholdDb = Math.round(
     Math.max(-44, Math.min(-18, (noiseFloorDb - 6) * 0.65))
   );
 
-  const audioStats: AudioLevelStats = {
-    rawPeakDb,
-    rawSpeechRmsDb,
-    rawMeanDb,
-    noiseFloorDb,
-    appliedGainDb,
-    suggestedThresholdDb,
-  };
-
   return {
-    peaks: normalizedPeaks,
-    rawRms,
-    duration,
-    sampleRate: peaksPerSecond,
-    audioBuffer,
-    audioStats,
+    peaks,
+    audioStats: {
+      rawPeakDb: toDb(maxSamplePeak),
+      rawSpeechRmsDb: toDb(p95Rms),
+      rawMeanDb: toDb(meanRms),
+      noiseFloorDb,
+      appliedGainDb,
+      suggestedThresholdDb,
+    },
   };
+}
+
+/**
+ * Extract waveform (RMS windows across all channels) + normalized peaks + level stats.
+ * Strategy: low-rate (8kHz) decodeAudioData first; if that fails, scan the real loudness via
+ * <video> + AnalyserNode. Never returns dummy zero arrays — throws a descriptive error instead.
+ * This must be run in the background AFTER the video has been registered.
+ */
+export async function extractWaveformPeaks(
+  file: File | Blob,
+  peaksPerSecond = 50,
+  onProgress?: (ratio: number, message: string) => void
+): Promise<{
+  peaks: number[];
+  rawRms: number[];
+  duration: number;
+  sampleRate: number;
+  audioStats: AudioLevelStats;
+  method: 'decode' | 'media-element';
+}> {
+  let decodeError: unknown = null;
+
+  try {
+    onProgress?.(0.05, '音声をデコード中 (8kHz)...');
+    const audioBuffer = await decodeAudioBufferRobust(file);
+    const { rawRms, maxSamplePeak } = rmsWindowsFromBuffer(
+      audioBuffer,
+      peaksPerSecond
+    );
+    const { peaks, audioStats } = buildWaveformAnalysis(rawRms, maxSamplePeak);
+    return {
+      peaks,
+      rawRms,
+      duration: audioBuffer.duration,
+      sampleRate: peaksPerSecond,
+      audioStats,
+      method: 'decode',
+    };
+  } catch (err) {
+    decodeError = err;
+  }
+
+  try {
+    onProgress?.(0.1, 'デコード失敗: 再生スキャン方式で音量を計測中...');
+    const scan = await scanAudioLevelsViaMediaElement(
+      file,
+      peaksPerSecond,
+      (r) =>
+        onProgress?.(0.1 + r * 0.9, `再生スキャンで音量を計測中 ${Math.round(r * 100)}%`)
+    );
+    const { peaks, audioStats } = buildWaveformAnalysis(
+      scan.rawRms,
+      scan.maxSamplePeak
+    );
+    return {
+      peaks,
+      rawRms: scan.rawRms,
+      duration: scan.duration,
+      sampleRate: peaksPerSecond,
+      audioStats,
+      method: 'media-element',
+    };
+  } catch (scanErr) {
+    const a = decodeError instanceof Error ? decodeError.message : '';
+    const b = scanErr instanceof Error ? scanErr.message : String(scanErr);
+    throw new Error(
+      `音声の解析に失敗しました（デコード: ${a} / 再生スキャン: ${b}）。映像の再生・編集は可能です。`
+    );
+  }
 }
 
 /**
@@ -337,6 +459,12 @@ export function detectSilenceOnTimeline(
     if (asset.audioDecodeError) {
       throw new Error(
         `音声デコードエラーのため無音検知できません: ${asset.audioDecodeError}`
+      );
+    }
+
+    if (asset.audioAnalyzing) {
+      throw new Error(
+        `動画「${asset.name}」の音声を解析中です。完了するまでお待ちください。`
       );
     }
 
@@ -532,7 +660,7 @@ export async function renderTimelineAudioChunksForWhisper(
     const asset = mediaAssets.find((m) => m.id === clip.mediaId);
     if (!asset?.file) continue;
     onProgress?.(`音声トラックを解析中: ${asset.name}...`);
-    const audioBuf = await decodeAudioBufferRobust(asset.file);
+    const audioBuf = await decodeAudioBufferRobust(asset.file, 16000);
     decodedMap.set(clip.mediaId, audioBuf);
   }
 
