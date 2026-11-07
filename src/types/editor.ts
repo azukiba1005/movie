@@ -92,6 +92,21 @@ export interface BgmClip {
   fadeOut: number; // seconds
 }
 
+export interface AudioLevelStats {
+  /** Raw maximum peak level in dBFS (e.g. -3.2 dB) */
+  rawPeakDb: number;
+  /** Raw 95th percentile speech RMS in dBFS (e.g. -14.5 dB) */
+  rawSpeechRmsDb: number;
+  /** Raw average RMS in dBFS (e.g. -22.0 dB) */
+  rawMeanDb: number;
+  /** Estimated background silence/noise floor in normalized dB (e.g. -48.0 dB) */
+  noiseFloorDb: number;
+  /** Applied normalization gain in dB so peak = 0 dB */
+  appliedGainDb: number;
+  /** Recommended threshold in dB for silence cutting */
+  suggestedThresholdDb: number;
+}
+
 export interface MediaAsset {
   id: string;
   name: string;
@@ -103,9 +118,15 @@ export interface MediaAsset {
   height?: number;
   sizeBytes: number;
   mimeType: string;
-  /** Normalized waveform peaks (0..1) sampled at e.g. 50 peaks/sec of source media */
+  /** Peak-normalized RMS waveform values (0..1, where 1.0 = 0dB normalized peak) sampled at e.g. 50 windows/sec */
   waveformPeaks: number[];
-  waveformSampleRate: number; // peaks per second (e.g. 50)
+  waveformSampleRate: number; // windows per second (e.g. 50)
+  /** Raw un-normalized RMS waveform values (0..1) */
+  rawWaveformRms?: number[];
+  /** Measured audio level statistics (max dB, mean dB, noise floor, suggested threshold) */
+  audioStats?: AudioLevelStats;
+  /** Error message if audio track decoding failed */
+  audioDecodeError?: string;
   missingFile?: boolean; // true when loaded from a lightweight .zip pack before video re-link
 }
 
@@ -118,9 +139,11 @@ export interface CustomFontAsset {
 }
 
 export interface SilenceConfig {
-  thresholdDb: number; // e.g. -38 dB
+  thresholdDb: number; // e.g. -32 dB
   minSilenceDurationMs: number; // e.g. 400 ms
   paddingMs: number; // e.g. 100 ms before & after speech
+  /** When true (default), evaluates dB relative to the video's normalized peak (0dB = max volume) */
+  autoNormalize?: boolean;
 }
 
 export interface CutInterval {

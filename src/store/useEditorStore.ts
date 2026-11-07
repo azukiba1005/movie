@@ -299,6 +299,7 @@ export interface EditorState {
 
   // Media & Fonts Actions
   addMediaAsset: (asset: MediaAsset, autoAddToTimeline?: boolean) => void;
+  updateMediaAsset: (mediaId: string, patch: Partial<MediaAsset>) => void;
   relinkMissingVideoAsset: (mediaId: string, file: File, objectUrl: string) => void;
   removeMediaAsset: (mediaId: string) => void;
   registerCustomFont: (fontAsset: CustomFontAsset) => Promise<void>;
@@ -390,9 +391,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   selectedItemId: null,
 
   silenceConfig: {
-    thresholdDb: -36,
+    thresholdDb: -30,
     minSilenceDurationMs: 400,
     paddingMs: 100,
+    autoNormalize: true,
   },
   cutIntervals: [],
   isTranscribing: false,
@@ -554,6 +556,14 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         get().addBgmClipFromAsset(asset.id);
       }
     }
+  },
+
+  updateMediaAsset: (mediaId, patch) => {
+    set((state) => ({
+      mediaAssets: state.mediaAssets.map((m) =>
+        m.id === mediaId ? { ...m, ...patch } : m
+      ),
+    }));
   },
 
   relinkMissingVideoAsset: (mediaId, file, objectUrl) => {

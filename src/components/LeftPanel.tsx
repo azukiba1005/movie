@@ -19,11 +19,13 @@ import {
   RefreshCw,
   Wand2,
   Loader2,
+  AlertCircle,
+  Activity,
 } from 'lucide-react';
 import { useEditorStore } from '../store/useEditorStore';
 import {
   detectSilenceOnTimeline,
-   encodeMonoAudioBufferToWav,
+  encodeMonoAudioBufferToWav,
   extractWaveformPeaks,
   probeMediaMetadata,
   renderTimelineAudioChunksForWhisper,
@@ -48,6 +50,7 @@ export const LeftPanel: React.FC = () => {
 
   const setLeftPanelTab = useEditorStore((s) => s.setLeftPanelTab);
   const addMediaAsset = useEditorStore((s) => s.addMediaAsset);
+  const updateMediaAsset = useEditorStore((s) => s.updateMediaAsset);
   const relinkMissingVideoAsset = useEditorStore(
     (s) => s.relinkMissingVideoAsset
   );
@@ -81,6 +84,8 @@ export const LeftPanel: React.FC = () => {
 
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [isReanalyzingAudio, setIsReanalyzingAudio] = useState(false);
+  const [silenceError, setSilenceError] = useState<string | null>(null);
   const [relinkTargetId, setRelinkTargetId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -92,6 +97,7 @@ export const LeftPanel: React.FC = () => {
     if (files.length === 0) return;
 
     setIsLoadingFiles(true);
+    setSilenceError(null);
     try {
       for (const file of files) {
         const lower = file.name.toLowerCase();
@@ -132,7 +138,34 @@ export const LeftPanel: React.FC = () => {
         ) {
           const objectUrl = URL.createObjectURL(file);
           const meta = await probeMediaMetadata(objectUrl, 'video');
-          const waveform = await extractWaveformPeaks(file, 50);
+
+          let peaks: number[] = [];
+          let rawRms: number[] = [];
+          let sampleRate = 50;
+          let decodedDuration = meta.duration;
+          let audioStats = undefined;
+          let audioDecodeError: string | undefined = undefined;
+
+          try {
+            const waveform = await extractWaveformPeaks(file, 50);
+            peaks = waveform.peaks;
+            rawRms = waveform.rawRms;
+            sampleRate = waveform.sampleRate;
+            if (waveform.duration > 0) {
+              decodedDuration = waveform.duration;
+            }
+            audioStats = waveform.audioStats;
+            setSilenceConfig({
+              thresholdDb: waveform.audioStats.suggestedThresholdDb,
+              autoNormalize: true,
+            });
+          } catch (decodeErr) {
+            audioDecodeError =
+              decodeErr instanceof Error
+                ? decodeErr.message
+                : String(decodeErr);
+            setSilenceError(audioDecodeError);
+          }
 
           const asset: MediaAsset = {
             id: `media-v-${Date.now()}-${Math.random()
@@ -142,16 +175,27 @@ export const LeftPanel: React.FC = () => {
             type: 'video',
             file,
             objectUrl,
-            duration: waveform.duration > 0 ? waveform.duration : meta.duration,
+            duration: decodedDuration,
             width: meta.width,
             height: meta.height,
             sizeBytes: file.size,
             mimeType: file.type || 'video/mp4',
-            waveformPeaks: waveform.peaks,
-            waveformSampleRate: waveform.sampleRate,
+            waveformPeaks: peaks,
+            rawWaveformRms: rawRms,
+            waveformSampleRate: sampleRate,
+            audioStats,
+            audioDecodeError,
           };
           addMediaAsset(asset, true);
-          setStatusNotification(`動画「${file.name}」を追加しました`);
+          if (audioDecodeError) {
+            setStatusNotification(
+              `動画「${file.name}」を追加しましたが音声デコードに失敗しました: ${audioDecodeError}`
+            );
+          } else {
+            setStatusNotification(
+              `動画「${file.name}」を追加しました（最大 ${audioStats?.rawPeakDb} dBFS / 発話 ${audioStats?.rawSpeechRmsDb} dBFS）`
+            );
+          }
           continue;
         }
 
@@ -179,7 +223,9 @@ export const LeftPanel: React.FC = () => {
             sizeBytes: file.size,
             mimeType: file.type || 'audio/mpeg',
             waveformPeaks: waveform.peaks,
+            rawWaveformRms: waveform.rawRms,
             waveformSampleRate: waveform.sampleRate,
+            audioStats: waveform.audioStats,
           };
           addMediaAsset(asset, true);
           setStatusNotification(`BGM「${file.name}」を追加しました`);
@@ -193,9 +239,53 @@ export const LeftPanel: React.FC = () => {
     }
   };
 
+  // Re-analyze audio waveform & multi-channel RMS dB stats for loaded video assets
+  const handleReanalyzeAudio = async (targetAssetId?: string) => {
+    const videoAssets = mediaAssets.filter(
+      (m) =>
+        m.type === 'video' &&
+        Boolean(m.file) &&
+        (!targetAssetId || m.id === targetAssetId)
+    );
+    if (videoAssets.length === 0) {
+      setStatusNotification('再解析できる動画ファイルが見つかりません');
+      return;
+    }
+
+    setIsReanalyzingAudio(true);
+    setSilenceError(null);
+    try {
+      for (const asset of videoAssets) {
+        if (!asset.file) continue;
+        const waveform = await extractWaveformPeaks(asset.file, 50);
+        updateMediaAsset(asset.id, {
+          waveformPeaks: waveform.peaks,
+          rawWaveformRms: waveform.rawRms,
+          waveformSampleRate: waveform.sampleRate,
+          audioStats: waveform.audioStats,
+          audioDecodeError: undefined,
+        });
+        setSilenceConfig({
+          thresholdDb: waveform.audioStats.suggestedThresholdDb,
+          autoNormalize: true,
+        });
+        setStatusNotification(
+          `音声波形を再解析しました（最大 ${waveform.audioStats.rawPeakDb} dBFS / 推奨しきい値 ${waveform.audioStats.suggestedThresholdDb} dB）`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSilenceError(msg);
+      setStatusNotification(`音声再解析エラー: ${msg}`);
+    } finally {
+      setIsReanalyzingAudio(false);
+    }
+  };
+
   // Generate a synthetic playable demo project (with real audio buffer, silent intervals, and retakes/fillers)
   const handleLoadDemoProject = async () => {
     setIsLoadingFiles(true);
+    setSilenceError(null);
     try {
       const durationSec = 20;
       const sampleRate = 16000;
@@ -275,10 +365,16 @@ export const LeftPanel: React.FC = () => {
         sizeBytes: demoFile.size,
         mimeType: 'audio/wav',
         waveformPeaks: waveform.peaks,
+        rawWaveformRms: waveform.rawRms,
         waveformSampleRate: waveform.sampleRate,
+        audioStats: waveform.audioStats,
       };
 
       addMediaAsset(demoAsset, true);
+      setSilenceConfig({
+        thresholdDb: waveform.audioStats.suggestedThresholdDb,
+        autoNormalize: true,
+      });
       setSubtitlesFromTranscription(
         speechSegments.map((s, idx) => ({
           id: `demo-sub-${idx}`,
@@ -299,30 +395,38 @@ export const LeftPanel: React.FC = () => {
 
   // Run Silence Detection on Track 2
   const handleDetectSilence = () => {
+    setSilenceError(null);
     if (videoClips.length === 0) {
       setStatusNotification('先に動画クリップをタイムラインに追加してください');
       return;
     }
-    const intervals = detectSilenceOnTimeline(
-      videoClips,
-      mediaAssets,
-      silenceConfig
-    );
-    setCutIntervals(intervals);
-    if (intervals.length === 0) {
-      setStatusNotification(
-        '現在のしきい値条件では無音区間が検出されませんでした'
+    try {
+      const intervals = detectSilenceOnTimeline(
+        videoClips,
+        mediaAssets,
+        silenceConfig
       );
-    } else {
-      const totalSaved = intervals.reduce(
-        (acc, i) => acc + (i.end - i.start),
-        0
-      );
-      setStatusNotification(
-        `${intervals.length}箇所の無音区間（計 ${totalSaved.toFixed(
-          1
-        )}秒）を検出しました`
-      );
+      setCutIntervals(intervals);
+      if (intervals.length === 0) {
+        setStatusNotification(
+          '現在のしきい値条件では無音区間が検出されませんでした（しきい値を少し上げてみてください）'
+        );
+      } else {
+        const totalSaved = intervals.reduce(
+          (acc, i) => acc + (i.end - i.start),
+          0
+        );
+        setStatusNotification(
+          `${intervals.length}箇所の無音区間（計 ${totalSaved.toFixed(
+            1
+          )}秒）を検出しました`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSilenceError(msg);
+      setCutIntervals([]);
+      setStatusNotification(`無音検出エラー: ${msg}`);
     }
   };
 
@@ -477,6 +581,7 @@ export const LeftPanel: React.FC = () => {
   };
 
   const selectedCutCount = cutIntervals.filter((c) => c.selected).length;
+  const primaryVideoAsset = mediaAssets.find((m) => m.type === 'video');
 
   return (
     <div className="flex flex-col h-full bg-[#1b1b1f] border-r border-zinc-800 select-none overflow-hidden">
@@ -496,13 +601,27 @@ export const LeftPanel: React.FC = () => {
         ref={relinkInputRef}
         type="file"
         accept="video/*,.mp4,.mov,.webm"
-        onChange={(e) => {
+        onChange={async (e) => {
           const file = e.target.files?.[0];
           e.target.value = '';
           if (file && relinkTargetId) {
-            const url = URL.createObjectURL(file);
-            relinkMissingVideoAsset(relinkTargetId, file, url);
+            const targetId = relinkTargetId;
             setRelinkTargetId(null);
+            const url = URL.createObjectURL(file);
+            relinkMissingVideoAsset(targetId, file, url);
+            try {
+              const waveform = await extractWaveformPeaks(file, 50);
+              updateMediaAsset(targetId, {
+                waveformPeaks: waveform.peaks,
+                rawWaveformRms: waveform.rawRms,
+                waveformSampleRate: waveform.sampleRate,
+                audioStats: waveform.audioStats,
+                audioDecodeError: undefined,
+              });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              updateMediaAsset(targetId, { audioDecodeError: msg });
+            }
           }
         }}
         className="hidden"
@@ -754,12 +873,121 @@ export const LeftPanel: React.FC = () => {
                   <VolumeX className="w-4 h-4 text-cyan-400" />
                   <span>① 無音ジェットカット (Web Audio API)</span>
                 </div>
+                {primaryVideoAsset?.file && (
+                  <button
+                    onClick={() => handleReanalyzeAudio(primaryVideoAsset.id)}
+                    disabled={isReanalyzingAudio}
+                    title="全チャンネルの音声波形と音量レベル(dB)を再解析"
+                    className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-[10px] text-cyan-300 flex items-center gap-1 transition"
+                  >
+                    <RefreshCw
+                      className={`w-3 h-3 ${
+                        isReanalyzingAudio ? 'animate-spin' : ''
+                      }`}
+                    />
+                    <span>波形再解析</span>
+                  </button>
+                )}
               </div>
+
+              {/* Current Video Audio Level Stats (Peak / Speech RMS / Mean / Noise Floor) */}
+              {primaryVideoAsset?.audioStats && (
+                <div className="p-2.5 rounded-lg bg-zinc-950/90 border border-zinc-800/90 space-y-2">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="flex items-center gap-1 text-zinc-300 font-semibold">
+                      <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>動画の音声レベル解析値</span>
+                    </span>
+                    <button
+                      onClick={() =>
+                        setSilenceConfig({
+                          thresholdDb:
+                            primaryVideoAsset.audioStats!.suggestedThresholdDb,
+                          autoNormalize: true,
+                        })
+                      }
+                      className="px-1.5 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono transition"
+                    >
+                      推奨値 ({primaryVideoAsset.audioStats.suggestedThresholdDb}{' '}
+                      dB) を適用
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5 text-[10px] font-mono">
+                    <div className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800/80 flex justify-between">
+                      <span className="text-zinc-400">最大ピーク:</span>
+                      <span className="text-zinc-100 font-semibold">
+                        {primaryVideoAsset.audioStats.rawPeakDb} dBFS
+                      </span>
+                    </div>
+                    <div className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800/80 flex justify-between">
+                      <span className="text-zinc-400">発話平均(95%):</span>
+                      <span className="text-cyan-300 font-semibold">
+                        {primaryVideoAsset.audioStats.rawSpeechRmsDb} dBFS
+                      </span>
+                    </div>
+                    <div className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800/80 flex justify-between">
+                      <span className="text-zinc-400">全体平均:</span>
+                      <span className="text-zinc-200">
+                        {primaryVideoAsset.audioStats.rawMeanDb} dBFS
+                      </span>
+                    </div>
+                    <div className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800/80 flex justify-between">
+                      <span className="text-zinc-400">推定ノイズ床:</span>
+                      <span className="text-amber-300">
+                        {primaryVideoAsset.audioStats.noiseFloorDb} dB
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Auto-Normalize (Peak Auto-Gain) Toggle */}
+              <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={silenceConfig.autoNormalize !== false}
+                  onChange={(e) =>
+                    setSilenceConfig({ autoNormalize: e.target.checked })
+                  }
+                  className="mt-0.5 accent-cyan-500 rounded cursor-pointer"
+                />
+                <div className="text-[11px] leading-snug">
+                  <div className="font-semibold text-zinc-200">
+                    ピーク正規化（オートゲイン 0dB 基準）で判定
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">
+                    録音レベルが小さい動画でも発話ピークを自動的に 0dB
+                    へ引き上げて判定し、動画全体が無音と誤検出されるのを防ぎます。
+                  </div>
+                </div>
+              </label>
+
+              {/* Inline Error Banner if audio decode failed or threshold would cut 100% */}
+              {(silenceError || primaryVideoAsset?.audioDecodeError) && (
+                <div className="p-2.5 rounded-lg bg-rose-950/50 border border-rose-500/50 text-[11px] text-rose-200 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="font-semibold text-rose-300">
+                      無音検出エラー
+                    </div>
+                    <div className="leading-relaxed">
+                      {silenceError || primaryVideoAsset?.audioDecodeError}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Threshold dB Slider */}
               <div className="space-y-1">
                 <div className="flex justify-between text-[11px]">
-                  <span className="text-zinc-400">無音しきい値 (Threshold)</span>
+                  <span className="text-zinc-400">
+                    無音しきい値 (
+                    {silenceConfig.autoNormalize !== false
+                      ? '正規化 dB'
+                      : 'Raw dBFS'}
+                    )
+                  </span>
                   <span className="font-mono text-cyan-300">
                     {silenceConfig.thresholdDb} dB
                   </span>
@@ -767,7 +995,7 @@ export const LeftPanel: React.FC = () => {
                 <input
                   type="range"
                   min={-60}
-                  max={-15}
+                  max={-10}
                   step={1}
                   value={silenceConfig.thresholdDb}
                   onChange={(e) =>
