@@ -1,0 +1,5 @@
+# Copy this file to .dev.vars for local `wrangler dev` execution
+# Leave APP_PASSCODE empty to disable authentication in local development
+APP_PASSCODE=
+GEMINI_API_KEY=
+

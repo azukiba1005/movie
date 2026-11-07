@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Cloudflare Wrangler
+.wrangler/
+.dev.vars
+
+# TypeScript cache
+*.tsbuildinfo
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,20 @@
+name = "cloudflare-ai-video-editor"
+main = "worker/index.ts"
+compatibility_date = "2025-02-14"
+compatibility_flags = ["nodejs_compat"]
+
+# Static Assets (Vite build output)
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Cloudflare Workers AI Binding (for @cf/openai/whisper-large-v3-turbo)
+[ai]
+binding = "AI"
+
+[vars]
+# Default environment variables (override via .dev.vars locally or `wrangler secret put` in production)
+# APP_PASSCODE = ""
+# GEMINI_API_KEY = ""
+
