@@ -25,6 +25,13 @@ export interface CutCandidate {
   confidence: number;
 }
 
+/** Gemini models tried in order (auto-fallback when a model is retired / unavailable) */
+const GEMINI_MODEL_FALLBACKS = [
+  'gemini-2.5-flash',
+  'gemini-3.0-flash',
+  'gemini-2.5-pro',
+];
+
 const app = new Hono<{ Bindings: Env }>();
 
 // Enable CORS for local Vite development and API calls
@@ -370,9 +377,10 @@ app.post('/api/analyze-cut', async (c) => {
 - 必要な本編の解説まで誤ってカットしないよう、明確に不要な区間のみを選出してください。
 ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
 
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
-      geminiApiKey
-    )}`;
+    const buildGeminiUrl = (model: string) =>
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
+        geminiApiKey
+      )}`;
 
     const geminiPayload = {
       systemInstruction: {
@@ -442,23 +450,58 @@ ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
       },
     };
 
-    const response = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(geminiPayload),
-    });
+    // Try models in order; fall back when a model is unavailable (404 / retired) or temporarily failing
+    let response: Response | null = null;
+    let usedModel = '';
+    const attemptErrors: string[] = [];
 
-    if (!response.ok) {
-      const errText = await response.text();
+    for (const model of GEMINI_MODEL_FALLBACKS) {
+      let res: Response;
+      try {
+        res = await fetch(buildGeminiUrl(model), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiPayload),
+        });
+      } catch (err) {
+        attemptErrors.push(
+          `${model}: ${err instanceof Error ? err.message : String(err)}`
+        );
+        continue;
+      }
+
+      if (res.ok) {
+        response = res;
+        usedModel = model;
+        break;
+      }
+
+      const errText = await res.text();
+      attemptErrors.push(`${model} (${res.status}): ${errText.slice(0, 300)}`);
+
+      // Auth / bad request errors will not be fixed by switching models
+      if (res.status === 400 || res.status === 401 || res.status === 403) {
+        if (!/no longer available|not found|not supported/i.test(errText)) {
+          return c.json(
+            { error: `Gemini API エラー (${res.status}): ${errText}` },
+            res.status as 400 | 401 | 403
+          );
+        }
+      }
+    }
+
+    if (!response) {
       return c.json(
         {
-          error: `Gemini API エラー (${response.status}): ${errText}`,
+          error: `すべてのGeminiモデルでリクエストに失敗しました: ${attemptErrors.join(
+            ' | '
+          )}`,
         },
-        response.status as 400 | 401 | 403 | 429 | 500
+        502
       );
     }
+
+    c.header('X-Gemini-Model-Used', usedModel);
 
     const geminiData = (await response.json()) as {
       candidates?: Array<{
@@ -511,7 +554,7 @@ ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
       }))
       .sort((a, b) => a.start - b.start);
 
-    return c.json({ candidates });
+    return c.json({ candidates, model: usedModel });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return c.json(
