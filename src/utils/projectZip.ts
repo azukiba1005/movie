@@ -44,6 +44,8 @@ export async function exportProjectToZip(
       mimeType: asset.mimeType,
       waveformPeaks: asset.waveformPeaks,
       waveformSampleRate: asset.waveformSampleRate,
+      rawWaveformRms: asset.rawWaveformRms,
+      audioStats: asset.audioStats,
       includedInZip: shouldInclude,
       zipPath,
     });
@@ -256,6 +258,8 @@ export async function importProjectFromZip(
         mimeType: meta.mimeType,
         waveformPeaks: meta.waveformPeaks || [],
         waveformSampleRate: meta.waveformSampleRate || 50,
+        rawWaveformRms: meta.rawWaveformRms,
+        audioStats: meta.audioStats,
         missingFile: false,
       });
     } else {
@@ -275,6 +279,8 @@ export async function importProjectFromZip(
         mimeType: meta.mimeType,
         waveformPeaks: meta.waveformPeaks || [],
         waveformSampleRate: meta.waveformSampleRate || 50,
+        rawWaveformRms: meta.rawWaveformRms,
+        audioStats: meta.audioStats,
         missingFile: true,
       });
     }

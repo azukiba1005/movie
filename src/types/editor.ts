@@ -188,6 +188,8 @@ export interface SerializedProjectJson {
     mimeType: string;
     waveformPeaks: number[];
     waveformSampleRate: number;
+    rawWaveformRms?: number[];
+    audioStats?: AudioLevelStats;
     includedInZip: boolean;
     zipPath?: string;
   }>;
