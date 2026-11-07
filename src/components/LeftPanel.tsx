@@ -518,7 +518,11 @@ export const LeftPanel: React.FC = () => {
         );
       } else {
         setStatusNotification(
-          `Gemini AIが ${candidates.length} 箇所のカット候補（言い直し・フィラー等）を検出しました`
+          `${
+            data.provider === 'workers-ai'
+              ? 'Workers AI（バックアップ）'
+              : 'Gemini'
+          }(${data.model || '-'}) が ${candidates.length} 箇所のカット候補（言い直し・フィラー等）を検出しました`
         );
       }
     } catch (err) {

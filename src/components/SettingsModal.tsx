@@ -164,7 +164,7 @@ export const SettingsModal: React.FC = () => {
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
               <Sparkles className="w-4 h-4 text-amber-400" />
-              <span>Gemini API キー (gemini-2.5-flash 文脈カット用)</span>
+              <span>Gemini API キー (文脈カット用・モデル自動検出)</span>
             </label>
             <input
               type="password"
@@ -175,8 +175,8 @@ export const SettingsModal: React.FC = () => {
             />
             <p className="text-[11px] text-zinc-400 leading-relaxed">
               文字起こし結果から「言い直し」「フィラー（えー、あー）」「不要な雑談」を{' '}
-              <code className="text-zinc-300">gemini-2.5-flash</code>{' '}
-              で自動検出する際に使用します。ブラウザのローカルストレージにのみ保存されます。
+              <code className="text-zinc-300">Gemini</code>{' '}
+              （利用可能な最新の Flash/Pro モデルを自動検出）で検出する際に使用します。キー未設定・クォータ超過時は Cloudflare Workers AI (Llama) に自動切替します。ブラウザのローカルストレージにのみ保存されます。
             </p>
           </div>
 

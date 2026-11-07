@@ -25,12 +25,256 @@ export interface CutCandidate {
   confidence: number;
 }
 
-/** Gemini models tried in order (auto-fallback when a model is retired / unavailable) */
-const GEMINI_MODEL_FALLBACKS = [
-  'gemini-2.5-flash',
-  'gemini-3.0-flash',
-  'gemini-2.5-pro',
+/** Preferred Gemini models (current names). If the first one 404s we auto-discover via ListModels. */
+const GEMINI_PREFERRED_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-3.1-pro-preview',
+  'gemini-3-pro-preview',
+  'gemini-flash-latest',
+  'gemini-pro-latest',
 ];
+
+/** Cloudflare Workers AI backup models (used when Gemini key is missing / quota / all models fail) */
+const WORKERS_AI_CUT_MODELS = [
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/meta/llama-3.1-8b-instruct',
+];
+
+/** Last model that worked in this isolate (avoids a 404 + ListModels round-trip on every call) */
+let cachedGeminiModel: string | null = null;
+
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+function isModelUnavailable(status: number, body: string): boolean {
+  return (
+    status === 404 ||
+    /no longer available|is not found|not found for api version|is not supported|deprecated/i.test(
+      body
+    )
+  );
+}
+
+/** GET v1beta/models -> names (without "models/") that support generateContent and contain "gemini" */
+async function listGeminiGenerateContentModels(
+  apiKey: string
+): Promise<string[]> {
+  const names: string[] = [];
+  let pageToken = '';
+  for (let page = 0; page < 5; page++) {
+    const url =
+      `${GEMINI_BASE}/models?pageSize=200&key=${encodeURIComponent(apiKey)}` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`ListModels (${res.status}): ${(await res.text()).slice(0, 200)}`);
+    }
+    const data = (await res.json()) as {
+      models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+      nextPageToken?: string;
+    };
+    for (const m of data.models || []) {
+      if (
+        m.name &&
+        /gemini/i.test(m.name) &&
+        (m.supportedGenerationMethods || []).includes('generateContent')
+      ) {
+        names.push(m.name.replace(/^models\//, ''));
+      }
+    }
+    if (!data.nextPageToken) break;
+    pageToken = data.nextPageToken;
+  }
+  return names;
+}
+
+/** Order discovered models: flash first, then pro, then others; non-lite before lite; newest version first */
+function rankDiscoveredGeminiModels(names: string[]): string[] {
+  const usable = names.filter(
+    (n) =>
+      !/embed|image|tts|live|audio|native|aqa|robotics|computer-use|learnlm|imagen/i.test(
+        n
+      )
+  );
+  const group = (n: string) => (/flash/i.test(n) ? 0 : /pro/i.test(n) ? 1 : 2);
+  const version = (n: string) => {
+    const m = n.match(/gemini-(\d+(?:\.\d+)?)/i);
+    return m ? parseFloat(m[1]) : 0;
+  };
+  const lite = (n: string) => (/lite/i.test(n) ? 1 : 0);
+  const preview = (n: string) => (/preview|exp/i.test(n) ? 1 : 0);
+  return [...usable].sort(
+    (a, b) =>
+      group(a) - group(b) ||
+      lite(a) - lite(b) ||
+      version(b) - version(a) ||
+      preview(a) - preview(b) ||
+      a.localeCompare(b)
+  );
+}
+
+/**
+ * Call Gemini with automatic model discovery:
+ *  1. try the cached / first preferred model
+ *  2. on 404 / "no longer available" (or quota/5xx) call ListModels and try the preferred models that
+ *     actually exist, then dynamically ranked ones (flash > pro)
+ * Throws on hard errors (invalid key etc.) or when no model works.
+ */
+async function runGeminiWithModelDiscovery(
+  apiKey: string,
+  payload: unknown
+): Promise<{ text: string; model: string }> {
+  const errors: string[] = [];
+  const tried = new Set<string>();
+
+  const attempt = async (
+    model: string
+  ): Promise<{ text: string; model: string } | 'retry'> => {
+    tried.add(model);
+    let res: Response;
+    try {
+      res = await fetch(
+        `${GEMINI_BASE}/models/${model}:generateContent?key=${encodeURIComponent(
+          apiKey
+        )}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }
+      );
+    } catch (err) {
+      errors.push(`${model}: ${err instanceof Error ? err.message : String(err)}`);
+      return 'retry';
+    }
+    const bodyText = await res.text();
+    if (res.ok) {
+      const data = JSON.parse(bodyText) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      };
+      const text = (data.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text || '')
+        .join('');
+      cachedGeminiModel = model;
+      return { text: text || '{"candidates":[]}', model };
+    }
+    errors.push(`${model} (${res.status}): ${bodyText.slice(0, 200)}`);
+    if (cachedGeminiModel === model && isModelUnavailable(res.status, bodyText)) {
+      cachedGeminiModel = null;
+    }
+    if (
+      isModelUnavailable(res.status, bodyText) ||
+      res.status === 429 ||
+      res.status >= 500
+    ) {
+      return 'retry';
+    }
+    throw new Error(`Gemini API エラー (${res.status}): ${bodyText.slice(0, 300)}`);
+  };
+
+  const first = cachedGeminiModel || GEMINI_PREFERRED_MODELS[0];
+  const firstResult = await attempt(first);
+  if (firstResult !== 'retry') return firstResult;
+
+  // Discover what this API key can actually use
+  let ordered: string[] = [];
+  try {
+    const available = await listGeminiGenerateContentModels(apiKey);
+    const availableSet = new Set(available);
+    const preferredAvailable = GEMINI_PREFERRED_MODELS.filter((m) =>
+      availableSet.has(m)
+    );
+    ordered = [...preferredAvailable, ...rankDiscoveredGeminiModels(available)];
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : String(err));
+    ordered = [...GEMINI_PREFERRED_MODELS]; // blind fallback if ListModels itself fails
+  }
+
+  let attempts = 0;
+  for (const model of ordered) {
+    if (tried.has(model)) continue;
+    if (attempts++ >= 5) break;
+    const result = await attempt(model);
+    if (result !== 'retry') return result;
+  }
+
+  throw new Error(`利用可能なGeminiモデルが見つかりません: ${errors.join(' | ')}`);
+}
+
+/** Backup: same cut analysis with Cloudflare Workers AI (Llama), returns raw JSON text */
+async function runWorkersAiCutAnalysis(
+  ai: Ai,
+  systemInstruction: string,
+  transcriptText: string
+): Promise<{ text: string; model: string }> {
+  const runner = ai as unknown as {
+    run: (model: string, input: unknown) => Promise<unknown>;
+  };
+  const jsonRule = `
+
+出力は次の形式のJSONオブジェクトのみを返してください（説明文・コードブロック・前置きは禁止）:
+{"candidates":[{"start":数値(秒),"end":数値(秒),"category":"retake"|"filler"|"tangent","reason":"日本語の理由","text":"該当発話","confidence":0.0〜1.0の数値}]}
+カットすべき区間が無い場合は {"candidates":[]} を返してください。`;
+
+  const errors: string[] = [];
+  for (const model of WORKERS_AI_CUT_MODELS) {
+    try {
+      const out = await runner.run(model, {
+        messages: [
+          { role: 'system', content: systemInstruction + jsonRule },
+          {
+            role: 'user',
+            content: `以下のタイムスタンプ付き文字起こしからカット候補をJSONで出力してください。\n\n${transcriptText}`,
+          },
+        ],
+        max_tokens: 2048,
+        temperature: 0.2,
+      });
+      const r = (out as { response?: unknown } | null)?.response;
+      const text =
+        typeof r === 'string' ? r : JSON.stringify(r ?? out ?? { candidates: [] });
+      return { text, model: `workers-ai:${model}` };
+    } catch (err) {
+      errors.push(`${model}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw new Error(errors.join(' | '));
+}
+
+/** Tolerant JSON extraction for LLM output (handles code fences / surrounding prose / bare arrays) */
+function parseCutJson(raw: string): {
+  candidates?: Array<{
+    start: number;
+    end: number;
+    category: 'retake' | 'filler' | 'tangent';
+    reason: string;
+    text: string;
+    confidence?: number;
+  }>;
+} {
+  const tryParse = (t: string) => {
+    try {
+      return JSON.parse(t) as unknown;
+    } catch {
+      return undefined;
+    }
+  };
+  const cleaned = raw.replace(/```(?:json)?/gi, '').trim();
+  let value = tryParse(cleaned);
+  if (value === undefined) {
+    const o1 = cleaned.indexOf('{');
+    const o2 = cleaned.lastIndexOf('}');
+    if (o1 >= 0 && o2 > o1) value = tryParse(cleaned.slice(o1, o2 + 1));
+  }
+  if (value === undefined) {
+    const a1 = cleaned.indexOf('[');
+    const a2 = cleaned.lastIndexOf(']');
+    if (a1 >= 0 && a2 > a1) value = tryParse(cleaned.slice(a1, a2 + 1));
+  }
+  if (Array.isArray(value)) return { candidates: value as never };
+  if (value && typeof value === 'object') return value as never;
+  return { candidates: [] };
+}
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -335,17 +579,6 @@ app.post('/api/analyze-cut', async (c) => {
       c.req.header('X-Gemini-Api-Key')?.trim() ||
       c.env.GEMINI_API_KEY?.trim();
 
-    if (!geminiApiKey) {
-      return c.json(
-        {
-          error:
-            'Gemini APIキーが設定されていません。画面右上の「設定」ボタンから Gemini API キーを入力するか、環境変数 GEMINI_API_KEY を設定してください。',
-          code: 'MISSING_GEMINI_KEY',
-        },
-        400
-      );
-    }
-
     const segments = body.segments || [];
     if (!Array.isArray(segments) || segments.length === 0) {
       return c.json(
@@ -376,11 +609,6 @@ app.post('/api/analyze-cut', async (c) => {
 - start と end は元のセグメントの秒数（小数）を正確に指定してください。
 - 必要な本編の解説まで誤ってカットしないよう、明確に不要な区間のみを選出してください。
 ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
-
-    const buildGeminiUrl = (model: string) =>
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
-        geminiApiKey
-      )}`;
 
     const geminiPayload = {
       systemInstruction: {
@@ -450,79 +678,59 @@ ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
       },
     };
 
-    // Try models in order; fall back when a model is unavailable (404 / retired) or temporarily failing
-    let response: Response | null = null;
+    let rawJsonText = '';
     let usedModel = '';
-    const attemptErrors: string[] = [];
+    let provider: 'gemini' | 'workers-ai' = 'gemini';
+    const failures: string[] = [];
 
-    for (const model of GEMINI_MODEL_FALLBACKS) {
-      let res: Response;
+    // 1) Gemini with dynamic model discovery
+    if (geminiApiKey) {
       try {
-        res = await fetch(buildGeminiUrl(model), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(geminiPayload),
-        });
+        const r = await runGeminiWithModelDiscovery(geminiApiKey, geminiPayload);
+        rawJsonText = r.text;
+        usedModel = r.model;
       } catch (err) {
-        attemptErrors.push(
-          `${model}: ${err instanceof Error ? err.message : String(err)}`
-        );
-        continue;
+        failures.push(`Gemini: ${err instanceof Error ? err.message : String(err)}`);
       }
-
-      if (res.ok) {
-        response = res;
-        usedModel = model;
-        break;
-      }
-
-      const errText = await res.text();
-      attemptErrors.push(`${model} (${res.status}): ${errText.slice(0, 300)}`);
-
-      // Auth / bad request errors will not be fixed by switching models
-      if (res.status === 400 || res.status === 401 || res.status === 403) {
-        if (!/no longer available|not found|not supported/i.test(errText)) {
-          return c.json(
-            { error: `Gemini API エラー (${res.status}): ${errText}` },
-            res.status as 400 | 401 | 403
-          );
-        }
-      }
+    } else {
+      failures.push('Gemini: APIキーが未設定です');
     }
 
-    if (!response) {
-      return c.json(
-        {
-          error: `すべてのGeminiモデルでリクエストに失敗しました: ${attemptErrors.join(
-            ' | '
-          )}`,
-        },
-        502
-      );
+    // 2) Backup: Cloudflare Workers AI (Llama)
+    if (!usedModel) {
+      if (!c.env.AI) {
+        return c.json(
+          {
+            error: `AI文脈カットに失敗しました（Workers AI バインディングも利用できません）: ${failures.join(
+              ' | '
+            )}`,
+            code: geminiApiKey ? 'GEMINI_FAILED' : 'MISSING_GEMINI_KEY',
+          },
+          geminiApiKey ? 502 : 400
+        );
+      }
+      try {
+        const r = await runWorkersAiCutAnalysis(
+          c.env.AI,
+          systemInstruction,
+          transcriptText
+        );
+        rawJsonText = r.text;
+        usedModel = r.model;
+        provider = 'workers-ai';
+      } catch (err) {
+        failures.push(
+          `Workers AI: ${err instanceof Error ? err.message : String(err)}`
+        );
+        return c.json(
+          { error: `AI文脈カットに失敗しました: ${failures.join(' | ')}` },
+          502
+        );
+      }
     }
 
     c.header('X-Gemini-Model-Used', usedModel);
-
-    const geminiData = (await response.json()) as {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{ text?: string }>;
-        };
-      }>;
-    };
-
-    const rawJsonText =
-      geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '{"candidates":[]}';
-    const parsed = JSON.parse(rawJsonText) as {
-      candidates?: Array<{
-        start: number;
-        end: number;
-        category: 'retake' | 'filler' | 'tangent';
-        reason: string;
-        text: string;
-        confidence?: number;
-      }>;
-    };
+    const parsed = parseCutJson(rawJsonText);
 
     const rawCandidates = Array.isArray(parsed.candidates)
       ? parsed.candidates
@@ -554,7 +762,12 @@ ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
       }))
       .sort((a, b) => a.start - b.start);
 
-    return c.json({ candidates, model: usedModel });
+    return c.json({
+      candidates,
+      model: usedModel,
+      provider,
+      warnings: failures,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return c.json(
