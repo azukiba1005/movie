@@ -401,17 +401,33 @@ export const LeftPanel: React.FC = () => {
   };
 
   // Run Silence Detection on Track 2
-  const handleDetectSilence = () => {
+  const handleDetectSilence = async () => {
     setSilenceError(null);
     if (videoClips.length === 0) {
       setStatusNotification('先に動画クリップをタイムラインに追加してください');
       return;
     }
     try {
+      // If waveform data is missing / failed, (re-)run the full 3-stage analysis first
+      const needsAnalysis = mediaAssets.filter(
+        (a) =>
+          a.type === 'video' &&
+          Boolean(a.file) &&
+          !a.audioAnalyzing &&
+          videoClips.some((c) => c.mediaId === a.id) &&
+          (a.waveformPeaks.length === 0 || Boolean(a.audioDecodeError))
+      );
+      for (const a of needsAnalysis) {
+        if (a.file) {
+          setStatusNotification(`「${a.name}」の音声を再解析しています...`);
+          await analyzeAssetInBackground(a.id, a.file, 50, true);
+        }
+      }
+      const state = useEditorStore.getState();
       const intervals = detectSilenceOnTimeline(
-        videoClips,
-        mediaAssets,
-        silenceConfig
+        state.videoClips,
+        state.mediaAssets,
+        state.silenceConfig
       );
       setCutIntervals(intervals);
       if (intervals.length === 0) {

@@ -77,183 +77,49 @@ function checkAudioBufferHasSignal(buffer: AudioBuffer): {
   };
 }
 
-/** Low sample-rate used for waveform analysis (8kHz = ~1/6 memory of 48kHz) */
-const ANALYSIS_SAMPLE_RATE = 8000;
-/** Above this size, skip arrayBuffer()-based decoding and scan via <video> element instead */
+/** Above this size, skip arrayBuffer()-based decoding and go straight to the <video> scan */
 const MAX_DECODE_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
+/** Peak below this is treated as "all zero" (decode/scan silently failed) */
+const ZERO_PEAK_EPSILON = 1e-5;
+
+type RawLevels = {
+  rawRms: number[];
+  maxSamplePeak: number;
+  duration: number;
+};
+
+function getAudioContextCtor(): typeof AudioContext | undefined {
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext
+  );
+}
 
 /**
- * Lightweight, memory-safe audio decoder (8kHz by default).
- * - Stage 1: AudioContext({ sampleRate }) decodeAudioData
- * - Stage 2: OfflineAudioContext(1ch, sampleRate) decodeAudioData
- * - Stage 3: native-rate AudioContext decodeAudioData
- * The file is re-read for each stage because decodeAudioData detaches the ArrayBuffer.
- * Throws if every stage fails (callers fall back to the media-element scan).
+ * Decode with the DEFAULT AudioContext (native 44.1k/48k — a forced low sampleRate can return
+ * an all-zero buffer on some browsers/codecs). Callers downsample to RMS windows immediately
+ * so the huge AudioBuffer can be garbage collected.
  */
-async function decodeAudioBufferRobust(
-  file: File | Blob,
-  sampleRate = ANALYSIS_SAMPLE_RATE
-): Promise<AudioBuffer> {
-  const AudioCtx =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext })
-      .webkitAudioContext;
-  const OfflineCtx =
-    window.OfflineAudioContext ||
-    (
-      window as unknown as {
-        webkitOfflineAudioContext: typeof OfflineAudioContext;
-      }
-    ).webkitOfflineAudioContext;
-
+async function decodeAudioBufferNative(file: File | Blob): Promise<AudioBuffer> {
+  const AudioCtx = getAudioContextCtor();
+  if (!AudioCtx) {
+    throw new Error('このブラウザは Web Audio API に対応していません。');
+  }
   if (file.size === 0) {
     throw new Error('ファイルデータが空です。');
   }
   if (file.size > MAX_DECODE_FILE_BYTES) {
     throw new Error('ファイルが大きすぎるため直接デコードをスキップします。');
   }
-
-  let lastError: unknown = null;
-
-  const attempts: Array<() => Promise<AudioBuffer>> = [];
-  if (AudioCtx) {
-    attempts.push(async () => {
-      const ctx = new AudioCtx({ sampleRate });
-      try {
-        return await ctx.decodeAudioData(await file.arrayBuffer());
-      } finally {
-        await ctx.close().catch(() => {});
-      }
-    });
-  }
-  if (OfflineCtx) {
-    attempts.push(async () => {
-      const ctx = new OfflineCtx(1, 1, sampleRate);
-      return await ctx.decodeAudioData(await file.arrayBuffer());
-    });
-  }
-  if (AudioCtx) {
-    attempts.push(async () => {
-      const ctx = new AudioCtx();
-      try {
-        return await ctx.decodeAudioData(await file.arrayBuffer());
-      } finally {
-        await ctx.close().catch(() => {});
-      }
-    });
-  }
-
-  for (const attempt of attempts) {
-    try {
-      const buffer = await attempt();
-      if (checkAudioBufferHasSignal(buffer).hasSignal) {
-        return buffer;
-      }
-      lastError = new Error('デコード結果の信号がすべて 0 でした');
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  const errDetail =
-    lastError instanceof Error ? ` (${lastError.message})` : '';
-  throw new Error(`音声データをデコードできませんでした${errDetail}`);
-}
-
-/**
- * Fallback: scan real loudness via <video> element + MediaElementAudioSourceNode + AnalyserNode.
- * Plays the file silently (the source is NOT connected to the speakers) at 4x speed and
- * records per-window RMS. Needs no arrayBuffer(), so it works for any size/codec the browser can play.
- */
-async function scanAudioLevelsViaMediaElement(
-  file: File | Blob,
-  peaksPerSecond: number,
-  onProgress?: (ratio: number) => void
-): Promise<{ rawRms: number[]; duration: number; maxSamplePeak: number }> {
-  const AudioCtx =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext })
-      .webkitAudioContext;
-  if (!AudioCtx) {
-    throw new Error('このブラウザは Web Audio API に対応していません。');
-  }
-
-  const url = URL.createObjectURL(file);
-  const el = document.createElement('video');
-  el.preload = 'auto';
-  el.src = url;
-  el.playsInline = true;
-
   const ctx = new AudioCtx();
-  let timer: number | null = null;
-
-  const cleanup = () => {
-    if (timer !== null) window.clearInterval(timer);
-    try {
-      el.pause();
-    } catch {
-      /* ignore */
-    }
-    el.removeAttribute('src');
-    el.load();
-    ctx.close().catch(() => {});
-    URL.revokeObjectURL(url);
-  };
-
   try {
-    await new Promise<void>((resolve, reject) => {
-      el.onloadedmetadata = () => resolve();
-      el.onerror = () => reject(new Error('メディアを読み込めませんでした'));
-    });
-
-    const duration = Number.isFinite(el.duration) ? el.duration : 0;
-    if (duration <= 0) {
-      throw new Error('動画の長さを取得できませんでした');
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
     }
-
-    const totalWindows = Math.max(1, Math.ceil(duration * peaksPerSecond));
-    const rawRms = new Array<number>(totalWindows).fill(0);
-    let maxSamplePeak = 0;
-
-    const source = ctx.createMediaElementSource(el);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    source.connect(analyser); // intentionally not connected to destination (silent)
-    const data = new Float32Array(analyser.fftSize);
-
-    await ctx.resume();
-    el.playbackRate = 4;
-    await el.play();
-
-    await new Promise<void>((resolve, reject) => {
-      let lastBin = 0;
-      const sample = () => {
-        analyser.getFloatTimeDomainData(data);
-        let sumSq = 0;
-        for (let i = 0; i < data.length; i++) {
-          const a = Math.abs(data[i]);
-          if (a > maxSamplePeak) maxSamplePeak = a;
-          sumSq += a * a;
-        }
-        const rms = Math.sqrt(sumSq / data.length);
-        const bin = Math.min(
-          totalWindows - 1,
-          Math.floor(el.currentTime * peaksPerSecond)
-        );
-        for (let b = Math.min(lastBin, bin); b <= bin; b++) {
-          if (rms > rawRms[b]) rawRms[b] = rms;
-        }
-        lastBin = bin;
-        onProgress?.(Math.min(1, el.currentTime / duration));
-      };
-      timer = window.setInterval(sample, 20);
-      el.onended = () => resolve();
-      el.onerror = () => reject(new Error('再生スキャン中にエラーが発生しました'));
-    });
-
-    return { rawRms, duration, maxSamplePeak };
+    return await ctx.decodeAudioData(await file.arrayBuffer());
   } finally {
-    cleanup();
+    await ctx.close().catch(() => {});
   }
 }
 
@@ -300,6 +166,210 @@ function rmsWindowsFromBuffer(
   return { rawRms, maxSamplePeak };
 }
 
+/** Stage 1: decodeAudioData with the default AudioContext, then downsample to RMS windows */
+async function levelsViaDecode(
+  file: File | Blob,
+  peaksPerSecond: number
+): Promise<RawLevels> {
+  const buffer = await decodeAudioBufferNative(file);
+  const duration = buffer.duration;
+  const { rawRms, maxSamplePeak } = rmsWindowsFromBuffer(buffer, peaksPerSecond);
+  if (maxSamplePeak < ZERO_PEAK_EPSILON) {
+    throw new Error('デコード結果の信号がすべて 0 でした');
+  }
+  return { rawRms, maxSamplePeak, duration };
+}
+
+type MediaScanMode = 'element' | 'capture';
+
+/**
+ * Stage 2 / 3: play the file in a <video> element and measure real loudness.
+ *  - 'element': MediaElementAudioSourceNode (element muted=false, volume=1; silenced by an output
+ *    GainNode(0) so nothing is audible). Multiple audioTracks are all enabled when supported.
+ *  - 'capture': video.captureStream()/mozCaptureStream() -> MediaStreamAudioSourceNode.
+ * Every audio block is mapped onto RMS windows using el.currentTime, so nothing is skipped
+ * even at high playback rates.
+ */
+async function levelsViaMediaPlayback(
+  file: File | Blob,
+  peaksPerSecond: number,
+  mode: MediaScanMode,
+  onProgress?: (ratio: number) => void
+): Promise<RawLevels> {
+  const AudioCtx = getAudioContextCtor();
+  if (!AudioCtx) {
+    throw new Error('このブラウザは Web Audio API に対応していません。');
+  }
+
+  const url = URL.createObjectURL(file);
+  const el = document.createElement('video');
+  el.preload = 'auto';
+  el.playsInline = true;
+  el.style.cssText =
+    'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;';
+  // 'element' mode MUST keep the element unmuted (muted => Web Audio receives zeros).
+  // 'capture' mode: mute the element so the user never hears it (capture is taken from the stream).
+  el.muted = mode === 'capture';
+  el.volume = 1.0;
+  el.src = url;
+  document.body.appendChild(el);
+
+  const ctx = new AudioCtx();
+  let watchdog: number | null = null;
+  let processor: ScriptProcessorNode | null = null;
+
+  const cleanup = () => {
+    if (watchdog !== null) window.clearInterval(watchdog);
+    if (processor) {
+      processor.onaudioprocess = null;
+      try {
+        processor.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      el.pause();
+    } catch {
+      /* ignore */
+    }
+    el.removeAttribute('src');
+    el.load();
+    el.remove();
+    ctx.close().catch(() => {});
+    URL.revokeObjectURL(url);
+  };
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      el.onloadedmetadata = () => resolve();
+      el.onerror = () => reject(new Error('メディアを読み込めませんでした'));
+    });
+
+    const duration = Number.isFinite(el.duration) ? el.duration : 0;
+    if (duration <= 0) {
+      throw new Error('動画の長さを取得できませんでした');
+    }
+
+    // Enable every audio track (OBS multi-track MP4: mic may live in track 2+)
+    const tracks = (
+      el as unknown as {
+        audioTracks?: { length: number; [i: number]: { enabled: boolean } };
+      }
+    ).audioTracks;
+    if (tracks && tracks.length > 0) {
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].enabled = true;
+      }
+    }
+
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+
+    const totalWindows = Math.max(1, Math.ceil(duration * peaksPerSecond));
+    const rawRms = new Array<number>(totalWindows).fill(0);
+    let maxSamplePeak = 0;
+    let lastTime = 0;
+
+    processor = ctx.createScriptProcessor(1024, 2, 1);
+    const silentGain = ctx.createGain();
+    silentGain.gain.value = 0; // inaudible, but keeps the graph (and onaudioprocess) alive
+    processor.connect(silentGain);
+    silentGain.connect(ctx.destination);
+
+    processor.onaudioprocess = (ev) => {
+      const input = ev.inputBuffer;
+      const n = input.length;
+      const nch = input.numberOfChannels;
+      const chans: Float32Array[] = [];
+      for (let c = 0; c < nch; c++) chans.push(input.getChannelData(c));
+
+      const t1 = el.currentTime;
+      const t0 = lastTime;
+      lastTime = t1;
+      const b0 = Math.min(totalWindows - 1, Math.max(0, Math.floor(t0 * peaksPerSecond)));
+      const b1 = Math.min(totalWindows - 1, Math.max(0, Math.floor(t1 * peaksPerSecond)));
+      const forward = b1 >= b0;
+      const segs = forward ? b1 - b0 + 1 : 1;
+
+      for (let s = 0; s < segs; s++) {
+        const start = Math.floor((s * n) / segs);
+        const end = Math.max(start + 1, Math.floor(((s + 1) * n) / segs));
+        let sumSq = 0;
+        for (let i = start; i < end && i < n; i++) {
+          let m = 0;
+          for (let c = 0; c < nch; c++) {
+            const a = Math.abs(chans[c][i]);
+            if (a > m) m = a;
+          }
+          if (m > maxSamplePeak) maxSamplePeak = m;
+          sumSq += m * m;
+        }
+        const rms = Math.sqrt(sumSq / Math.max(1, end - start));
+        const bin = forward ? b0 + s : b1;
+        if (rms > rawRms[bin]) rawRms[bin] = rms;
+      }
+      onProgress?.(Math.min(1, t1 / duration));
+    };
+
+    // Playback rate: fast but still reliably decoded/audible to the audio graph
+    try {
+      el.playbackRate = mode === 'capture' ? 4 : 8;
+    } catch {
+      el.playbackRate = 4;
+    }
+
+    try {
+      await el.play();
+    } catch {
+      throw new Error('動画の再生スキャンを開始できませんでした（自動再生制限）');
+    }
+
+    if (mode === 'element') {
+      const source = ctx.createMediaElementSource(el);
+      source.connect(processor);
+    } else {
+      const capEl = el as unknown as {
+        captureStream?: () => MediaStream;
+        mozCaptureStream?: () => MediaStream;
+      };
+      const stream = capEl.captureStream?.() ?? capEl.mozCaptureStream?.();
+      if (!stream) {
+        throw new Error('このブラウザは captureStream に対応していません');
+      }
+      // Audio tracks may appear shortly after playback starts
+      for (let i = 0; i < 30 && stream.getAudioTracks().length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (stream.getAudioTracks().length === 0) {
+        throw new Error('captureStream に音声トラックがありません');
+      }
+      ctx.createMediaStreamSource(stream).connect(processor);
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let lastProgressAt = Date.now();
+      let lastSeen = -1;
+      watchdog = window.setInterval(() => {
+        if (el.currentTime !== lastSeen) {
+          lastSeen = el.currentTime;
+          lastProgressAt = Date.now();
+        } else if (Date.now() - lastProgressAt > 20000) {
+          reject(new Error('再生スキャンが停止しました'));
+        }
+        if (el.currentTime >= duration - 0.05) resolve();
+      }, 500);
+      el.onended = () => resolve();
+      el.onerror = () => reject(new Error('再生スキャン中にエラーが発生しました'));
+    });
+
+    return { rawRms, maxSamplePeak, duration };
+  } finally {
+    cleanup();
+  }
+}
+
 /**
  * Build normalized peaks (relative dB, speech reference = 0 dB) and level statistics.
  * Throws if the signal is entirely zero.
@@ -316,7 +386,7 @@ function buildWaveformAnalysis(
     sumAllRms += r;
   }
 
-  if (maxSamplePeak <= 1e-5 || globalMaxWindowRms <= 1e-6) {
+  if (maxSamplePeak < ZERO_PEAK_EPSILON || globalMaxWindowRms <= 1e-6) {
     throw new Error(
       '音声トラックの信号レベルが完全にゼロ（無音）です。動画に音声が入っているか確認してください。'
     );
@@ -363,9 +433,12 @@ function buildWaveformAnalysis(
 
 /**
  * Extract waveform (RMS windows across all channels) + normalized peaks + level stats.
- * Strategy: low-rate (8kHz) decodeAudioData first; if that fails, scan the real loudness via
- * <video> + AnalyserNode. Never returns dummy zero arrays — throws a descriptive error instead.
- * This must be run in the background AFTER the video has been registered.
+ * Three-stage strategy — a stage counts as failed (and the next one runs) if it throws OR if the
+ * resulting maxPeak is < 1e-5:
+ *   1. decodeAudioData with the default AudioContext (+ immediate downsampling)
+ *   2. <video> playback scan: unmuted element -> AnalyserNode path -> GainNode(0) -> destination
+ *   3. video.captureStream() -> MediaStreamAudioSourceNode
+ * Never returns dummy zero arrays — throws a descriptive error instead.
  */
 export async function extractWaveformPeaks(
   file: File | Blob,
@@ -377,57 +450,72 @@ export async function extractWaveformPeaks(
   duration: number;
   sampleRate: number;
   audioStats: AudioLevelStats;
-  method: 'decode' | 'media-element';
+  method: 'decode' | 'media-element' | 'capture-stream';
 }> {
-  let decodeError: unknown = null;
-
-  try {
-    onProgress?.(0.05, '音声をデコード中 (8kHz)...');
-    const audioBuffer = await decodeAudioBufferRobust(file);
-    const { rawRms, maxSamplePeak } = rmsWindowsFromBuffer(
-      audioBuffer,
-      peaksPerSecond
-    );
-    const { peaks, audioStats } = buildWaveformAnalysis(rawRms, maxSamplePeak);
-    return {
-      peaks,
-      rawRms,
-      duration: audioBuffer.duration,
-      sampleRate: peaksPerSecond,
-      audioStats,
+  const stages: Array<{
+    method: 'decode' | 'media-element' | 'capture-stream';
+    label: string;
+    run: () => Promise<RawLevels>;
+  }> = [
+    {
       method: 'decode',
-    };
-  } catch (err) {
-    decodeError = err;
+      label: 'デコード',
+      run: async () => {
+        onProgress?.(0.05, '音声をデコード中...');
+        return levelsViaDecode(file, peaksPerSecond);
+      },
+    },
+    {
+      method: 'media-element',
+      label: '再生スキャン',
+      run: () =>
+        levelsViaMediaPlayback(file, peaksPerSecond, 'element', (r) =>
+          onProgress?.(
+            0.1 + r * 0.9,
+            `再生スキャンで音量を計測中 ${Math.round(r * 100)}%`
+          )
+        ),
+    },
+    {
+      method: 'capture-stream',
+      label: 'captureStream',
+      run: () =>
+        levelsViaMediaPlayback(file, peaksPerSecond, 'capture', (r) =>
+          onProgress?.(
+            0.1 + r * 0.9,
+            `captureStream で音量を計測中 ${Math.round(r * 100)}%`
+          )
+        ),
+    },
+  ];
+
+  const errors: string[] = [];
+
+  for (const stage of stages) {
+    try {
+      const levels = await stage.run();
+      const { peaks, audioStats } = buildWaveformAnalysis(
+        levels.rawRms,
+        levels.maxSamplePeak
+      );
+      return {
+        peaks,
+        rawRms: levels.rawRms,
+        duration: levels.duration,
+        sampleRate: peaksPerSecond,
+        audioStats,
+        method: stage.method,
+      };
+    } catch (err) {
+      errors.push(
+        `${stage.label}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
-  try {
-    onProgress?.(0.1, 'デコード失敗: 再生スキャン方式で音量を計測中...');
-    const scan = await scanAudioLevelsViaMediaElement(
-      file,
-      peaksPerSecond,
-      (r) =>
-        onProgress?.(0.1 + r * 0.9, `再生スキャンで音量を計測中 ${Math.round(r * 100)}%`)
-    );
-    const { peaks, audioStats } = buildWaveformAnalysis(
-      scan.rawRms,
-      scan.maxSamplePeak
-    );
-    return {
-      peaks,
-      rawRms: scan.rawRms,
-      duration: scan.duration,
-      sampleRate: peaksPerSecond,
-      audioStats,
-      method: 'media-element',
-    };
-  } catch (scanErr) {
-    const a = decodeError instanceof Error ? decodeError.message : '';
-    const b = scanErr instanceof Error ? scanErr.message : String(scanErr);
-    throw new Error(
-      `音声の解析に失敗しました（デコード: ${a} / 再生スキャン: ${b}）。映像の再生・編集は可能です。`
-    );
-  }
+  throw new Error(
+    `音声の解析に失敗しました（${errors.join(' / ')}）。映像の再生・編集は可能です。`
+  );
 }
 
 /**
@@ -660,7 +748,12 @@ export async function renderTimelineAudioChunksForWhisper(
     const asset = mediaAssets.find((m) => m.id === clip.mediaId);
     if (!asset?.file) continue;
     onProgress?.(`音声トラックを解析中: ${asset.name}...`);
-    const audioBuf = await decodeAudioBufferRobust(asset.file, 16000);
+    const audioBuf = await decodeAudioBufferNative(asset.file);
+    if (!checkAudioBufferHasSignal(audioBuf).hasSignal) {
+      throw new Error(
+        `「${asset.name}」の音声をデコードできませんでした（信号が 0）。先に「波形再解析」を実行してください。`
+      );
+    }
     decodedMap.set(clip.mediaId, audioBuf);
   }
 
