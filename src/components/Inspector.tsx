@@ -68,7 +68,7 @@ export const Inspector: React.FC = () => {
     (selectedItemType === 'subtitle' &&
       subtitles.find((s) => s.id === selectedItemId)) ||
     subtitles.find(
-      (s) => currentTime >= s.startTime && currentTime <= s.endTime
+      (s) => currentTime >= s.startTime && currentTime < s.endTime
     ) ||
     null;
 
@@ -895,7 +895,7 @@ export const Inspector: React.FC = () => {
             )}
 
             {/* Main Video Clip Settings */}
-            {targetVideoClip ? (
+            {targetBgmClip ? null : targetVideoClip ? (
               <div className="space-y-3">
                 {/* Playback Speed Card */}
                 <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-zinc-800 space-y-3">

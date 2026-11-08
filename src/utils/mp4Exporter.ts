@@ -162,14 +162,26 @@ async function renderAudioWindow(params: {
       return g;
     };
 
+    // Schedule envelope breakpoints (fade boundaries) so fades are not smeared across the window
+    const relEnd = relStart + overlapDur;
+    const breakpoints = [relStart];
+    const candidates = [bgm.fadeIn, bgm.duration - bgm.fadeOut];
+    for (const bp of candidates) {
+      if (bgm.fadeIn >= 0 && bp > relStart && bp < relEnd) breakpoints.push(bp);
+    }
+    breakpoints.push(relEnd);
+    breakpoints.sort((a, b) => a - b);
+
     gainNode.gain.setValueAtTime(
-      computeGainAtRel(relStart),
+      computeGainAtRel(breakpoints[0]),
       startInWindow
     );
-    gainNode.gain.linearRampToValueAtTime(
-      computeGainAtRel(relStart + overlapDur),
-      startInWindow + overlapDur
-    );
+    for (let bi = 1; bi < breakpoints.length; bi++) {
+      gainNode.gain.linearRampToValueAtTime(
+        computeGainAtRel(breakpoints[bi]),
+        startInWindow + (breakpoints[bi] - relStart)
+      );
+    }
 
     srcNode.connect(gainNode);
     gainNode.connect(offlineCtx.destination);

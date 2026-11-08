@@ -266,7 +266,7 @@ export const PreviewPlayer: React.FC = () => {
         }
 
         state.setCurrentTime(nextTime);
-        syncMediaElements(nextTime, state.isPlaying);
+        syncMediaElements(nextTime, useEditorStore.getState().isPlaying);
         drawCurrentFrame(nextTime);
       } else {
         lastFramePerfRef.current = now;
@@ -294,7 +294,7 @@ export const PreviewPlayer: React.FC = () => {
   // Interactive Canvas drag to reposition active subtitle
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const activeSubs = subtitles.filter(
-      (s) => currentTime >= s.startTime && currentTime <= s.endTime
+      (s) => currentTime >= s.startTime && currentTime < s.endTime
     );
     if (activeSubs.length === 0) return;
 

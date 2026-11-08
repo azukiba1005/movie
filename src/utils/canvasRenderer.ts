@@ -361,7 +361,7 @@ export function renderCompositeFrame(params: {
 
   // 3. Render active subtitles at timelineTime
   const activeSubtitles = subtitles.filter(
-    (s) => timelineTime >= s.startTime && timelineTime <= s.endTime
+    (s) => timelineTime >= s.startTime && timelineTime < s.endTime
   );
 
   for (const sub of activeSubtitles) {

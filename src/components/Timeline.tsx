@@ -315,13 +315,37 @@ export const Timeline: React.FC = () => {
             false
           );
         } else if (dragState.kind === 'bgm-trim-right') {
-          const nextDur = Math.max(
-            0.5,
-            dragState.initialEnd - dragState.initialStart + deltaSec
+          const targetBgm = useEditorStore
+            .getState()
+            .bgmClips.find((b) => b.id === dragState.id);
+          const bgmAsset = targetBgm
+            ? useEditorStore
+                .getState()
+                .mediaAssets.find((m) => m.id === targetBgm.mediaId)
+            : undefined;
+          const maxBgmDur =
+            targetBgm && bgmAsset && bgmAsset.duration > 0
+              ? Math.max(0.5, bgmAsset.duration - targetBgm.sourceStart)
+              : Infinity;
+          const nextDur = Math.min(
+            maxBgmDur,
+            Math.max(
+              0.5,
+              dragState.initialEnd - dragState.initialStart + deltaSec
+            )
           );
           updateBgmClip(
             dragState.id,
-            { duration: Number(nextDur.toFixed(3)) },
+            {
+              duration: Number(nextDur.toFixed(3)),
+              ...(targetBgm
+                ? {
+                    sourceEnd: Number(
+                      (targetBgm.sourceStart + nextDur).toFixed(3)
+                    ),
+                  }
+                : {}),
+            },
             false
           );
         }

@@ -138,7 +138,18 @@ export const LeftPanel: React.FC = () => {
         ) {
           const objectUrl = URL.createObjectURL(file);
           // 1) Only metadata (<video> loadedmetadata) — NO audio decoding is awaited here
-          const meta = await probeMediaMetadata(objectUrl, 'video');
+          const meta = await probeMediaMetadata(objectUrl, 'video').catch(
+            (err: unknown) => {
+              URL.revokeObjectURL(objectUrl);
+              setStatusNotification(
+                `「${file.name}」を読み込めませんでした: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              );
+              return null;
+            }
+          );
+          if (!meta) continue;
 
           const assetId = `media-v-${Date.now()}-${Math.random()
             .toString(36)
@@ -179,7 +190,18 @@ export const LeftPanel: React.FC = () => {
           lower.endsWith('.aac')
         ) {
           const objectUrl = URL.createObjectURL(file);
-          const meta = await probeMediaMetadata(objectUrl, 'bgm');
+          const meta = await probeMediaMetadata(objectUrl, 'bgm').catch(
+            (err: unknown) => {
+              URL.revokeObjectURL(objectUrl);
+              setStatusNotification(
+                `「${file.name}」を読み込めませんでした: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              );
+              return null;
+            }
+          );
+          if (!meta) continue;
           const assetId = `media-a-${Date.now()}-${Math.random()
             .toString(36)
             .slice(2, 6)}`;
