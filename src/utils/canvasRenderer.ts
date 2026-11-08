@@ -236,6 +236,15 @@ function renderSafeZoneGuides(
 }
 
 /**
+ * Holds the last successfully drawn video layer (no subtitles) so that seeking / not-yet-decoded
+ * frames never show a blank or black canvas: the previous valid frame is drawn instead.
+ */
+export interface FrameLayerCache {
+  canvas: HTMLCanvasElement | null;
+  valid: boolean;
+}
+
+/**
  * Render a complete composite frame (background + video clip + active subtitles + optional guides)
  */
 export function renderCompositeFrame(params: {
@@ -249,6 +258,8 @@ export function renderCompositeFrame(params: {
   subtitles: SubtitleItem[];
   showSafeZone?: boolean;
   missingVideoFile?: boolean;
+  /** Realtime preview only: keeps the last good video frame while seeking / decoding */
+  layerCache?: FrameLayerCache;
 }): void {
   const {
     ctx,
@@ -261,43 +272,78 @@ export function renderCompositeFrame(params: {
     subtitles,
     showSafeZone = false,
     missingVideoFile = false,
+    layerCache,
   } = params;
 
   // 1. Clear & fill base studio black
   ctx.fillStyle = '#09090b';
   ctx.fillRect(0, 0, canvasWidth, canvasHeight);
 
-  // 2. Render active video clip if available
-  if (
-    activeClip &&
-    videoElement &&
-    videoElement.readyState >= 2 &&
-    videoElement.videoWidth > 0 &&
-    !missingVideoFile
-  ) {
-    ctx.save();
-    const vw = videoElement.videoWidth;
-    const vh = videoElement.videoHeight;
+  // 2. Render active video clip if available (or hold the last valid frame)
+  let videoDrawn = false;
+  if (activeClip && videoElement && !missingVideoFile) {
+    const decodable = videoElement.readyState >= 2 && videoElement.videoWidth > 0;
+    // While seeking, keep showing the previous valid frame (never clear / blank the canvas)
+    const useLive =
+      decodable && !(layerCache?.valid && videoElement.seeking);
 
-    // Fit inside canvas while preserving aspect ratio
-    const baseScale = Math.min(canvasWidth / vw, canvasHeight / vh);
-    const finalScale = baseScale * (activeClip.scale || 1.0);
+    const drawVideoTo = (target: CanvasRenderingContext2D) => {
+      target.save();
+      const vw = videoElement.videoWidth;
+      const vh = videoElement.videoHeight;
 
-    const drawW = vw * finalScale;
-    const drawH = vh * finalScale;
+      // Fit inside canvas while preserving aspect ratio
+      const baseScale = Math.min(canvasWidth / vw, canvasHeight / vh);
+      const finalScale = baseScale * (activeClip.scale || 1.0);
 
-    const centerX = canvasWidth / 2 + (activeClip.positionX || 0);
-    const centerY = canvasHeight / 2 + (activeClip.positionY || 0);
+      const drawW = vw * finalScale;
+      const drawH = vh * finalScale;
 
-    ctx.drawImage(
-      videoElement,
-      centerX - drawW / 2,
-      centerY - drawH / 2,
-      drawW,
-      drawH
-    );
-    ctx.restore();
-  } else {
+      const centerX = canvasWidth / 2 + (activeClip.positionX || 0);
+      const centerY = canvasHeight / 2 + (activeClip.positionY || 0);
+
+      target.drawImage(
+        videoElement,
+        centerX - drawW / 2,
+        centerY - drawH / 2,
+        drawW,
+        drawH
+      );
+      target.restore();
+    };
+
+    if (useLive) {
+      if (layerCache) {
+        if (
+          !layerCache.canvas ||
+          layerCache.canvas.width !== canvasWidth ||
+          layerCache.canvas.height !== canvasHeight
+        ) {
+          layerCache.canvas = document.createElement('canvas');
+          layerCache.canvas.width = canvasWidth;
+          layerCache.canvas.height = canvasHeight;
+        }
+        const lctx = layerCache.canvas.getContext('2d', { alpha: false });
+        if (lctx) {
+          lctx.fillStyle = '#09090b';
+          lctx.fillRect(0, 0, canvasWidth, canvasHeight);
+          drawVideoTo(lctx);
+          layerCache.valid = true;
+          ctx.drawImage(layerCache.canvas, 0, 0);
+          videoDrawn = true;
+        }
+      }
+      if (!videoDrawn) {
+        drawVideoTo(ctx);
+        videoDrawn = true;
+      }
+    } else if (layerCache?.valid && layerCache.canvas) {
+      ctx.drawImage(layerCache.canvas, 0, 0);
+      videoDrawn = true;
+    }
+  }
+
+  if (!videoDrawn) {
     // Slate / Standby pattern when no video is loaded or when at an empty timeline spot
     ctx.save();
     const grad = ctx.createRadialGradient(
@@ -378,6 +424,8 @@ export function renderCompositeFrame(params: {
 /**
  * Draw a single camera feed (letterboxed, no subtitles) for the multicam monitor tiles.
  */
+const monitorHasFrame = new WeakSet<CanvasRenderingContext2D>();
+
 export function renderCameraMonitorFrame(params: {
   ctx: CanvasRenderingContext2D;
   width: number;
@@ -386,13 +434,18 @@ export function renderCameraMonitorFrame(params: {
   placeholder?: string;
 }): void {
   const { ctx, width, height, videoElement, placeholder } = params;
+  const ready = Boolean(
+    videoElement &&
+      videoElement.readyState >= 2 &&
+      videoElement.videoWidth > 0 &&
+      !videoElement.seeking
+  );
+  // Not decodable right now (seeking / switching): keep the previous frame on the tile
+  if (!ready && monitorHasFrame.has(ctx)) return;
   ctx.fillStyle = '#09090b';
   ctx.fillRect(0, 0, width, height);
-  if (
-    videoElement &&
-    videoElement.readyState >= 2 &&
-    videoElement.videoWidth > 0
-  ) {
+  if (videoElement && ready) {
+    monitorHasFrame.add(ctx);
     const scale = Math.min(
       width / videoElement.videoWidth,
       height / videoElement.videoHeight

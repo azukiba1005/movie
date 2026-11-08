@@ -13,6 +13,8 @@ export interface TranscribeSegment {
   start: number;
   end: number;
   text: string;
+  /** Word-level timestamps (timeline seconds, offset applied) when Whisper returns them */
+  words?: Array<{ text: string; start: number; end: number }>;
 }
 
 export interface CutCandidate {
@@ -459,17 +461,25 @@ app.post('/api/transcribe', async (c) => {
     }
 
     // Run @cf/openai/whisper-large-v3-turbo
+    interface WhisperRawWord {
+      word?: string;
+      text?: string;
+      start?: number;
+      end?: number;
+    }
+
     interface WhisperRawSegment {
       start?: number;
       end?: number;
       text?: string;
+      words?: WhisperRawWord[];
     }
 
     interface WhisperResult {
       text?: string;
       vtt?: string;
       segments?: WhisperRawSegment[];
-      words?: Array<{ word?: string; start?: number; end?: number }>;
+      words?: WhisperRawWord[];
     }
 
     let result: WhisperResult;
@@ -515,11 +525,38 @@ app.post('/api/transcribe', async (c) => {
             Math.max(start + 0.25, rawEnd + offsetSeconds).toFixed(3)
           );
           const text = (seg.text || '').trim();
+
+          // Word timestamps: prefer the segment's own words, else top-level words inside this span
+          const rawWords: WhisperRawWord[] =
+            Array.isArray(seg.words) && seg.words.length > 0
+              ? seg.words
+              : (result.words || []).filter(
+                  (w) =>
+                    typeof w.start === 'number' &&
+                    w.start >= rawStart - 0.05 &&
+                    w.start < rawEnd + 0.05
+                );
+          const words = rawWords
+            .map((w) => {
+              const wText = (w.word ?? w.text ?? '').trim();
+              if (!wText || typeof w.start !== 'number') return null;
+              const ws = Number((w.start + offsetSeconds).toFixed(3));
+              const we = Number(
+                Math.max(
+                  ws + 0.02,
+                  (typeof w.end === 'number' ? w.end : w.start + 0.2) + offsetSeconds
+                ).toFixed(3)
+              );
+              return { text: wText, start: ws, end: we };
+            })
+            .filter((w): w is { text: string; start: number; end: number } => w !== null);
+
           return {
             id: `seg-${Math.round(start * 1000)}-${idx}`,
             start,
             end,
             text,
+            ...(words.length > 0 ? { words } : {}),
           };
         })
         .filter((s) => s.text.length > 0);
@@ -776,6 +813,229 @@ ${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
       },
       500
     );
+  }
+});
+
+/** Generic Workers AI JSON call (backup LLM) */
+async function runWorkersAiJson(
+  ai: Ai,
+  systemInstruction: string,
+  userText: string
+): Promise<{ text: string; model: string }> {
+  const runner = ai as unknown as {
+    run: (model: string, input: unknown) => Promise<unknown>;
+  };
+  const errors: string[] = [];
+  for (const model of WORKERS_AI_CUT_MODELS) {
+    try {
+      const out = await runner.run(model, {
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userText },
+        ],
+        max_tokens: 4096,
+        temperature: 0.2,
+      });
+      const r = (out as { response?: unknown } | null)?.response;
+      const text = typeof r === 'string' ? r : JSON.stringify(r ?? out ?? {});
+      return { text, model: `workers-ai:${model}` };
+    } catch (err) {
+      errors.push(`${model}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw new Error(errors.join(' | '));
+}
+
+/** Tolerant JSON extraction for LLM output */
+function parseLooseJson(raw: string): unknown {
+  const tryParse = (t: string) => {
+    try {
+      return JSON.parse(t) as unknown;
+    } catch {
+      return undefined;
+    }
+  };
+  const cleaned = raw.replace(/```(?:json)?/gi, '').trim();
+  let v = tryParse(cleaned);
+  if (v === undefined) {
+    const o1 = cleaned.indexOf('{');
+    const o2 = cleaned.lastIndexOf('}');
+    if (o1 >= 0 && o2 > o1) v = tryParse(cleaned.slice(o1, o2 + 1));
+  }
+  if (v === undefined) {
+    const a1 = cleaned.indexOf('[');
+    const a2 = cleaned.lastIndexOf(']');
+    if (a1 >= 0 && a2 > a1) v = tryParse(cleaned.slice(a1, a2 + 1));
+  }
+  return v;
+}
+
+/**
+ * POST /api/format-subtitles
+ * LLM "pro editor" formatting of subtitle segments: removes fillers, fixes kanji / mis-conversions,
+ * and splits each segment into short, easy-to-read chunks (chunks may contain "\n" for 2-line layout).
+ * Timing is allocated by the client (character ratio inside the original segment span).
+ */
+app.post('/api/format-subtitles', async (c) => {
+  try {
+    const body = await c.req.json<{
+      segments: Array<{ index: number; start: number; end: number; text: string }>;
+      apiKey?: string;
+      aspectRatio?: '16:9' | '9:16';
+      style?: 'machinegun' | 'standard' | 'twoline';
+      maxCharsPerLine?: number;
+      removeFillers?: boolean;
+      removePunctuation?: boolean;
+      customInstruction?: string;
+    }>();
+
+    const segments = (body.segments || []).slice(0, 60);
+    if (segments.length === 0) {
+      return c.json({ error: '整形対象のテロップがありません。' }, 400);
+    }
+
+    const geminiApiKey =
+      body.apiKey?.trim() ||
+      c.req.header('X-Gemini-Api-Key')?.trim() ||
+      c.env.GEMINI_API_KEY?.trim();
+
+    const aspect = body.aspectRatio === '9:16' ? '9:16' : '16:9';
+    const style = body.style || 'standard';
+    const maxChars = Math.max(
+      6,
+      Math.min(30, Math.round(body.maxCharsPerLine || (aspect === '9:16' ? 9 : 14)))
+    );
+    const maxLines = style === 'machinegun' ? 1 : 2;
+
+    const systemInstruction = `あなたはプロのYouTube動画編集者です。話し言葉の文字起こしを、そのまま公開できる読みやすいテロップに整形します。
+
+【ルール】
+- 入力の各セグメント(index)ごとに、テロップ1枚ぶんの文字列を並べた配列 chunks を返す（時間順）。
+- 1つの chunk は 1枚のテロップ。最大 ${maxLines} 行、1行あたり最大 ${maxChars} 文字（全角換算）。${
+      maxLines > 1
+        ? '2行にする場合は chunk 内に "\\n" を入れ、上下の文字数が均等で文節の切れ目になる位置で改行する。'
+        : '1行のみ（改行しない）。'
+    }
+- ${aspect === '9:16' ? '縦型ショート動画向け: テンポよく短く区切る。' : '横型動画向け: 意味の塊ごとに区切る。'}
+- 分割・改行は必ず意味の切れ目（文節・句読点・接続助詞の後）で行い、単語の途中（「自動|編集」「You|Tube」等）で切らない。
+${
+  body.removeFillers === false
+    ? ''
+    : '- 「えー」「あー」「えっと」「そのー」「まあ」などの不要なフィラー・言い淀みは削除する。\n'
+}- 漢字が連続して読みにくい箇所や明らかな誤変換は、文脈に合う自然な表記に直す。意味や内容は変えない・足さない。
+${
+  body.removePunctuation === false
+    ? ''
+    : '- 句点「。」と読点「、」は出力しない（！？… は残してよい）。\n'
+}- 発話がフィラーのみで内容が無い場合は chunks を空配列にする。
+${body.customInstruction ? `\n追加指示: ${body.customInstruction}` : ''}`;
+
+    const userText =
+      '次のセグメントを整形してください。\n\n' +
+      JSON.stringify(
+        segments.map((s) => ({
+          index: s.index,
+          start: s.start,
+          end: s.end,
+          text: s.text,
+        }))
+      );
+
+    const geminiPayload = {
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+      contents: [{ role: 'user', parts: [{ text: userText }] }],
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            results: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  index: { type: 'INTEGER' },
+                  chunks: { type: 'ARRAY', items: { type: 'STRING' } },
+                },
+                required: ['index', 'chunks'],
+              },
+            },
+          },
+          required: ['results'],
+        },
+      },
+    };
+
+    let rawText = '';
+    let usedModel = '';
+    let provider: 'gemini' | 'workers-ai' = 'gemini';
+    const failures: string[] = [];
+
+    if (geminiApiKey) {
+      try {
+        const r = await runGeminiWithModelDiscovery(geminiApiKey, geminiPayload);
+        rawText = r.text;
+        usedModel = r.model;
+      } catch (err) {
+        failures.push(`Gemini: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      failures.push('Gemini: APIキーが未設定です');
+    }
+
+    if (!usedModel) {
+      if (!c.env.AI) {
+        return c.json(
+          {
+            error: `テロップ整形に失敗しました（Workers AI も利用できません）: ${failures.join(' | ')}`,
+            code: geminiApiKey ? 'GEMINI_FAILED' : 'MISSING_GEMINI_KEY',
+          },
+          geminiApiKey ? 502 : 400
+        );
+      }
+      try {
+        const jsonRule = `\n\n出力は次の形式のJSONオブジェクトのみ（説明・コードブロック禁止）:\n{"results":[{"index":数値,"chunks":["テロップ1","テロップ2"]}]}`;
+        const r = await runWorkersAiJson(c.env.AI, systemInstruction + jsonRule, userText);
+        rawText = r.text;
+        usedModel = r.model;
+        provider = 'workers-ai';
+      } catch (err) {
+        failures.push(`Workers AI: ${err instanceof Error ? err.message : String(err)}`);
+        return c.json({ error: `テロップ整形に失敗しました: ${failures.join(' | ')}` }, 502);
+      }
+    }
+
+    const parsed = parseLooseJson(rawText) as
+      | { results?: unknown }
+      | unknown[]
+      | undefined;
+    const list: unknown[] = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as { results?: unknown } | undefined)?.results)
+      ? ((parsed as { results: unknown[] }).results)
+      : [];
+
+    const validIndexes = new Set(segments.map((s) => s.index));
+    const results = list
+      .map((item) => {
+        const it = item as { index?: unknown; chunks?: unknown };
+        const index = typeof it.index === 'number' ? it.index : NaN;
+        const chunks = Array.isArray(it.chunks)
+          ? it.chunks
+              .filter((x): x is string => typeof x === 'string')
+              .map((x) => x.replace(/\\n/g, '\n').trim())
+              .filter((x) => x.length > 0)
+          : [];
+        return { index, chunks };
+      })
+      .filter((r) => validIndexes.has(r.index));
+
+    c.header('X-Gemini-Model-Used', usedModel);
+    return c.json({ results, model: usedModel, provider, warnings: failures });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `テロップ整形中にエラーが発生しました: ${message}` }, 500);
   }
 });
 

@@ -653,7 +653,9 @@ export function detectSilenceOnTimeline(
   config: SilenceConfig
 ): CutInterval[] {
   const minSilenceSec = Math.max(0.08, config.minSilenceDurationMs / 1000);
-  const paddingSec = Math.max(0, config.paddingMs / 1000);
+  // Head protection (before next speech) / tail protection (after speech ends)
+  const padHeadSec = Math.max(0, (config.paddingBeforeMs ?? config.paddingMs) / 1000);
+  const padTailSec = Math.max(0, (config.paddingAfterMs ?? config.paddingMs) / 1000);
   const useNormalized = config.autoNormalize !== false;
   const minSpeechSec = Math.max(0, (config.minSpeechDurationMs ?? 150) / 1000);
 
@@ -737,8 +739,8 @@ export function detectSilenceOnTimeline(
       const rawTimelineEnd =
         clip.startTime + (srcSilenceEnd - clip.sourceStart) / clip.speed;
 
-      const paddedStart = rawTimelineStart + paddingSec;
-      const paddedEnd = rawTimelineEnd - paddingSec;
+      const paddedStart = rawTimelineStart + padTailSec;
+      const paddedEnd = rawTimelineEnd - padHeadSec;
 
       if (paddedEnd - paddedStart >= minSilenceSec) {
         detected.push({
@@ -751,7 +753,7 @@ export function detectSilenceOnTimeline(
             config.thresholdDb
           }dB${useNormalized ? ' 正規化基準' : ' Raw dBFS'}${
             voiceRaw ? ' / 声帯域300-3000Hz' : ''
-          }${minSpeechSec > 0 ? ` / ${Math.round(minSpeechSec * 1000)}ms未満の短音は無視` : ''})`,
+          } / 語頭${Math.round(padHeadSec * 1000)}ms・語尾${Math.round(padTailSec * 1000)}ms保護${minSpeechSec > 0 ? ` / ${Math.round(minSpeechSec * 1000)}ms未満の短音は無視` : ''})`,
           selected: true,
         });
       }

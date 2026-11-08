@@ -23,7 +23,11 @@ import {
   Activity,
   Camera,
 } from 'lucide-react';
-import { useEditorStore } from '../store/useEditorStore';
+import {
+  SILENCE_PRESETS,
+  SilencePresetId,
+  useEditorStore,
+} from '../store/useEditorStore';
 import {
   detectNoiseOutsideSubtitles,
   detectSilenceOnTimeline,
@@ -34,6 +38,19 @@ import {
   renderTimelineAudioChunksForWhisper,
 } from '../utils/audioAnalyzer';
 import { CustomFontAsset, CutInterval, MediaAsset } from '../types/editor';
+import {
+  defaultMaxChars,
+  formatSegment,
+  formatSegments,
+  groupSubtitles,
+  layoutLlmChunks,
+  RawSegment,
+  reformatSubtitleItems,
+  SPLIT_STYLE_INFO,
+  SplitStyle,
+  SubtitleFormatOptions,
+} from '../utils/subtitleFormatter';
+import { SubtitleTextEditor } from './SubtitleTextEditor';
 
 export const LeftPanel: React.FC = () => {
   const leftPanelTab = useEditorStore((s) => s.leftPanelTab);
@@ -51,6 +68,8 @@ export const LeftPanel: React.FC = () => {
   const appPasscode = useEditorStore((s) => s.appPasscode);
   const geminiApiKey = useEditorStore((s) => s.geminiApiKey);
   const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const aspectRatio = useEditorStore((s) => s.aspectRatio);
+  const replaceSubtitles = useEditorStore((s) => s.replaceSubtitles);
   const cam2Offset = useEditorStore((s) => s.cam2Offset);
   const setCam2MediaId = useEditorStore((s) => s.setCam2MediaId);
   const setCam2Offset = useEditorStore((s) => s.setCam2Offset);
@@ -99,6 +118,12 @@ export const LeftPanel: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const relinkInputRef = useRef<HTMLInputElement | null>(null);
   const cam2InputRef = useRef<HTMLInputElement | null>(null);
+  // Subtitle formatting (smart split / line break) settings
+  const [fmtStyle, setFmtStyle] = useState<SplitStyle>('standard');
+  const [fmtMaxChars, setFmtMaxChars] = useState<number | null>(null); // null = default for style/aspect
+  const [fmtRemovePunct, setFmtRemovePunct] = useState(true);
+  const [aiAfterTranscribe, setAiAfterTranscribe] = useState(false);
+  const [isAiFormatting, setIsAiFormatting] = useState(false);
   const [isSyncingCam, setIsSyncingCam] = useState(false);
   const [syncInfo, setSyncInfo] = useState<string | null>(null);
 
@@ -279,10 +304,8 @@ export const LeftPanel: React.FC = () => {
         audioDecodeError: undefined,
       });
       if (applyThreshold) {
-        setSilenceConfig({
-          thresholdDb: waveform.audioStats.suggestedThresholdDb,
-          autoNormalize: true,
-        });
+        // Keep the user's / preset threshold (mild by default); the suggestion stays available as a button
+        setSilenceConfig({ autoNormalize: true });
       }
       setStatusNotification(
         `音声解析が完了しました（ピーク ${waveform.audioStats.rawPeakDb} dBFS / 推奨しきい値 ${waveform.audioStats.suggestedThresholdDb} dB）`
@@ -418,10 +441,7 @@ export const LeftPanel: React.FC = () => {
       };
 
       addMediaAsset(demoAsset, true);
-      setSilenceConfig({
-        thresholdDb: waveform.audioStats.suggestedThresholdDb,
-        autoNormalize: true,
-      });
+      setSilenceConfig({ autoNormalize: true });
       setSubtitlesFromTranscription(
         speechSegments.map((s, idx) => ({
           id: `demo-sub-${idx}`,
@@ -439,6 +459,13 @@ export const LeftPanel: React.FC = () => {
       setIsLoadingFiles(false);
     }
   };
+
+  // Any manual slider change leaves the one-touch presets
+  const tuneSilence = (patch: Partial<typeof silenceConfig>) =>
+    setSilenceConfig({ ...patch, silencePreset: 'custom' });
+
+  const applySilencePreset = (id: SilencePresetId) =>
+    setSilenceConfig({ ...SILENCE_PRESETS[id].values, silencePreset: id });
 
   // Register Cam 2 (sub camera, video only — audio always comes from Cam 1)
   const handleCam2Selected = async (file: File) => {
@@ -671,6 +698,119 @@ export const LeftPanel: React.FC = () => {
     }
   };
 
+  // ---- Subtitle formatting -------------------------------------------------------------
+  const getFmtOptions = (): SubtitleFormatOptions => ({
+    aspectRatio,
+    style: fmtStyle,
+    maxCharsPerLine: fmtMaxChars ?? defaultMaxChars(aspectRatio, fmtStyle),
+    removePunctuation: fmtRemovePunct,
+  });
+
+  // Re-split / re-wrap all existing subtitles with the current settings (rule-based, instant)
+  const handleReformatSubtitles = () => {
+    const subs = useEditorStore.getState().subtitles;
+    if (subs.length === 0) {
+      setStatusNotification('整形するテロップがありません');
+      return;
+    }
+    const out = reformatSubtitleItems(subs, getFmtOptions());
+    replaceSubtitles(out);
+    setStatusNotification(
+      `テロップを再分割しました（${subs.length}件 → ${out.length}件 / ${SPLIT_STYLE_INFO[fmtStyle].label}・${
+        getFmtOptions().maxCharsPerLine
+      }文字）`
+    );
+  };
+
+  // LLM (Gemini / Workers AI) "pro editor" formatting
+  const handleAiFormatSubtitles = async () => {
+    const subs = useEditorStore.getState().subtitles;
+    if (subs.length === 0) {
+      setStatusNotification('整形するテロップがありません');
+      return;
+    }
+    setIsAiFormatting(true);
+    try {
+      const opts = getFmtOptions();
+      const groups = groupSubtitles(subs);
+      const resultMap = new Map<number, string[]>();
+      let usedModel = '';
+      let usedProvider = '';
+      const BATCH = 20;
+
+      for (let b = 0; b < groups.length; b += BATCH) {
+        setStatusNotification(
+          `AIでテロップを整形中... (${Math.min(b + BATCH, groups.length)}/${groups.length})`
+        );
+        const batch = groups.slice(b, b + BATCH).map((g, i) => ({
+          index: b + i,
+          start: g.segment.start,
+          end: g.segment.end,
+          text: g.segment.text,
+        }));
+        const res = await fetch('/api/format-subtitles', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-App-Passcode': appPasscode,
+            'X-Gemini-Api-Key': geminiApiKey,
+          },
+          body: JSON.stringify({
+            segments: batch,
+            apiKey: geminiApiKey,
+            aspectRatio: opts.aspectRatio,
+            style: opts.style,
+            maxCharsPerLine: opts.maxCharsPerLine,
+            removeFillers: true,
+            removePunctuation: opts.removePunctuation,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `API Error (${res.status})`);
+        usedModel = data.model || usedModel;
+        usedProvider = data.provider || usedProvider;
+        for (const r of data.results || []) {
+          if (typeof r.index === 'number' && Array.isArray(r.chunks)) {
+            resultMap.set(r.index, r.chunks);
+          }
+        }
+      }
+
+      const out: Array<ReturnType<typeof reformatSubtitleItems>[number]> = [];
+      let aiCount = 0;
+      groups.forEach((g, gi) => {
+        const seg = g.segment;
+        const style = g.items[0].style;
+        const gid = seg.groupId || `grp-ai-${Date.now().toString(36)}-${gi}`;
+        const chunks = resultMap.get(gi);
+        let pieces: ReturnType<typeof formatSegment>;
+        if (chunks && chunks.length > 0) {
+          pieces = layoutLlmChunks(chunks, seg.start, seg.end, opts, gid);
+          aiCount++;
+        } else if (chunks && chunks.length === 0 && seg.text.length <= 8) {
+          pieces = []; // filler-only utterance: dropped
+        } else {
+          // missing / suspicious AI result: fall back to the rule-based formatter
+          pieces = formatSegment({ ...seg, groupId: gid }, opts);
+        }
+        for (const p of pieces) out.push({ ...p, style });
+      });
+
+      if (out.length === 0) throw new Error('整形結果が空でした');
+      replaceSubtitles(out);
+      setStatusNotification(
+        `AI整形が完了しました（${subs.length}件 → ${out.length}件 / ${
+          usedProvider === 'workers-ai' ? 'Workers AI' : 'Gemini'
+        } ${usedModel || ''} / AI適用 ${aiCount}/${groups.length}）`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setStatusNotification(`AI整形エラー: ${msg}`);
+    } finally {
+      setIsAiFormatting(false);
+    }
+  };
+
   // Run Cloudflare Workers AI Whisper Transcription in 35s 16kHz Mono WAV Chunks
   const handleRunWhisperTranscription = async () => {
     if (videoClips.length === 0) {
@@ -688,12 +828,7 @@ export const LeftPanel: React.FC = () => {
         (msg) => setTranscribeState(true, 10, msg)
       );
 
-      const allSegments: Array<{
-        id: string;
-        start: number;
-        end: number;
-        text: string;
-      }> = [];
+      const allSegments: RawSegment[] = [];
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -728,10 +863,23 @@ export const LeftPanel: React.FC = () => {
       }
 
       if (allSegments.length > 0) {
-        setSubtitlesFromTranscription(allSegments);
-        setStatusNotification(
-          `自動文字起こしが完了しました（${allSegments.length}件のテロップを生成）`
+        // Smart split + natural line breaks (word timestamps are used when available)
+        const pieces = formatSegments(allSegments, getFmtOptions());
+        setSubtitlesFromTranscription(
+          pieces.map((p, i) => ({
+            id: `sub-ai-${Date.now()}-${i}`,
+            start: p.start,
+            end: p.end,
+            text: p.text,
+            groupId: p.groupId,
+          }))
         );
+        setStatusNotification(
+          `自動文字起こしが完了しました（${allSegments.length}セグメント → ${pieces.length}件のテロップに整形）`
+        );
+        if (aiAfterTranscribe) {
+          await handleAiFormatSubtitles();
+        }
       } else {
         setStatusNotification(
           '文字起こしが完了しましたが、発話セグメントが検出されませんでした'
@@ -1233,7 +1381,7 @@ export const LeftPanel: React.FC = () => {
                     </span>
                     <button
                       onClick={() =>
-                        setSilenceConfig({
+                        tuneSilence({
                           thresholdDb:
                             primaryVideoAsset.audioStats!.suggestedThresholdDb,
                           autoNormalize: true,
@@ -1305,6 +1453,33 @@ export const LeftPanel: React.FC = () => {
                 </div>
               )}
 
+              {/* One-touch presets */}
+              <div className="space-y-1">
+                <div className="text-[11px] text-zinc-400">プリセット</div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(Object.keys(SILENCE_PRESETS) as SilencePresetId[]).map((id) => {
+                    const active = silenceConfig.silencePreset === id;
+                    return (
+                      <button
+                        key={id}
+                        onClick={() => applySilencePreset(id)}
+                        title={SILENCE_PRESETS[id].description}
+                        className={`py-1.5 px-1 rounded border text-[11px] font-semibold leading-tight transition ${
+                          active
+                            ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200'
+                            : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        {SILENCE_PRESETS[id].label}
+                        <div className="text-[9px] font-normal opacity-70">
+                          {SILENCE_PRESETS[id].description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Auto-Normalize (Peak Auto-Gain) Toggle */}
               <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
                 <input
@@ -1362,7 +1537,7 @@ export const LeftPanel: React.FC = () => {
                   step={1}
                   value={silenceConfig.thresholdDb}
                   onChange={(e) =>
-                    setSilenceConfig({ thresholdDb: Number(e.target.value) })
+                    tuneSilence({ thresholdDb: Number(e.target.value) })
                   }
                   className="w-full accent-cyan-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer"
                 />
@@ -1405,7 +1580,7 @@ export const LeftPanel: React.FC = () => {
                   step={50}
                   value={silenceConfig.minSilenceDurationMs}
                   onChange={(e) =>
-                    setSilenceConfig({
+                    tuneSilence({
                       minSilenceDurationMs: Number(e.target.value),
                     })
                   }
@@ -1430,7 +1605,7 @@ export const LeftPanel: React.FC = () => {
                   step={10}
                   value={silenceConfig.minSpeechDurationMs ?? 150}
                   onChange={(e) =>
-                    setSilenceConfig({
+                    tuneSilence({
                       minSpeechDurationMs: Number(e.target.value),
                     })
                   }
@@ -1495,22 +1670,47 @@ export const LeftPanel: React.FC = () => {
                 </div>
               </label>
 
-              {/* Padding ms Slider */}
+              {/* Head protection (before speech) */}
               <div className="space-y-1">
                 <div className="flex justify-between text-[11px]">
-                  <span className="text-zinc-400">カット前後の余白 (パディング)</span>
+                  <span className="text-zinc-400">
+                    語頭保護（発話の前に残す余白）
+                  </span>
                   <span className="font-mono text-cyan-300">
-                    {silenceConfig.paddingMs} ms
+                    {silenceConfig.paddingBeforeMs ?? silenceConfig.paddingMs} ms
                   </span>
                 </div>
                 <input
                   type="range"
                   min={0}
-                  max={400}
+                  max={500}
                   step={10}
-                  value={silenceConfig.paddingMs}
+                  value={silenceConfig.paddingBeforeMs ?? silenceConfig.paddingMs}
                   onChange={(e) =>
-                    setSilenceConfig({ paddingMs: Number(e.target.value) })
+                    tuneSilence({ paddingBeforeMs: Number(e.target.value) })
+                  }
+                  className="w-full accent-cyan-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer"
+                />
+              </div>
+
+              {/* Tail protection (after speech) */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-zinc-400">
+                    語尾保護（発話の後に残す余白）
+                  </span>
+                  <span className="font-mono text-cyan-300">
+                    {silenceConfig.paddingAfterMs ?? silenceConfig.paddingMs} ms
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={600}
+                  step={10}
+                  value={silenceConfig.paddingAfterMs ?? silenceConfig.paddingMs}
+                  onChange={(e) =>
+                    tuneSilence({ paddingAfterMs: Number(e.target.value) })
                   }
                   className="w-full accent-cyan-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer"
                 />
@@ -1690,6 +1890,16 @@ export const LeftPanel: React.FC = () => {
                 </div>
               )}
 
+              <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={aiAfterTranscribe}
+                  onChange={(e) => setAiAfterTranscribe(e.target.checked)}
+                  className="accent-cyan-500 rounded cursor-pointer"
+                />
+                <span>文字起こし後にAIでも読みやすく整形する（Gemini / Workers AI）</span>
+              </label>
+
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleRunWhisperTranscription}
@@ -1711,6 +1921,97 @@ export const LeftPanel: React.FC = () => {
                   <Plus className="w-3.5 h-3.5" />
                   <span>手動追加</span>
                 </button>
+              </div>
+            </div>
+
+            {/* Subtitle formatting (re-split / line break / AI) */}
+            <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-purple-500/30 space-y-2.5">
+              <div className="text-xs font-bold text-zinc-100 flex items-center gap-1.5">
+                <SplitSquareHorizontal className="w-4 h-4 text-purple-400" />
+                <span>テロップ整形（分割・改行）</span>
+                <span className="ml-auto px-1.5 py-0.5 rounded bg-zinc-800 text-[10px] font-mono text-zinc-400">
+                  {aspectRatio === '9:16' ? 'ショート 9:16' : '横動画 16:9'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                {(Object.keys(SPLIT_STYLE_INFO) as SplitStyle[]).map((st) => {
+                  const active = fmtStyle === st;
+                  return (
+                    <button
+                      key={st}
+                      onClick={() => {
+                        setFmtStyle(st);
+                        setFmtMaxChars(null);
+                      }}
+                      title={SPLIT_STYLE_INFO[st].description}
+                      className={`py-1.5 px-1 rounded border text-[11px] font-semibold leading-tight transition ${
+                        active
+                          ? 'bg-purple-500/25 border-purple-400 text-purple-200'
+                          : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      {SPLIT_STYLE_INFO[st].label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="text-[10px] text-zinc-500">
+                {SPLIT_STYLE_INFO[fmtStyle].description}
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-zinc-400">1行の最大文字数</span>
+                  <span className="font-mono text-purple-300">
+                    {fmtMaxChars ?? defaultMaxChars(aspectRatio, fmtStyle)} 文字
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={8}
+                  max={22}
+                  step={1}
+                  value={fmtMaxChars ?? defaultMaxChars(aspectRatio, fmtStyle)}
+                  onChange={(e) => setFmtMaxChars(Number(e.target.value))}
+                  className="w-full accent-purple-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer"
+                />
+              </div>
+
+              <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={fmtRemovePunct}
+                  onChange={(e) => setFmtRemovePunct(e.target.checked)}
+                  className="accent-purple-500 rounded cursor-pointer"
+                />
+                <span>句読点（。、）を自動削除する</span>
+              </label>
+
+              <div className="grid grid-cols-1 gap-1.5">
+                <button
+                  onClick={handleReformatSubtitles}
+                  disabled={subtitles.length === 0}
+                  className="w-full py-2 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 disabled:opacity-40 text-purple-200 border border-purple-500/40 font-semibold text-xs flex items-center justify-center gap-1.5 transition"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>再分割を適用（全テロップ）</span>
+                </button>
+                <button
+                  onClick={handleAiFormatSubtitles}
+                  disabled={subtitles.length === 0 || isAiFormatting}
+                  className="w-full py-2 rounded-lg bg-gradient-to-r from-amber-500/25 to-orange-500/25 hover:from-amber-500/35 hover:to-orange-500/35 disabled:opacity-40 text-amber-200 border border-amber-500/40 font-semibold text-xs flex items-center justify-center gap-1.5 transition"
+                >
+                  {isAiFormatting ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5" />
+                  )}
+                  <span>✨ AIで読みやすく分割・改行整形</span>
+                </button>
+              </div>
+              <div className="text-[10px] text-zinc-500 leading-relaxed">
+                AI整形はフィラー（えー・あー）除去・誤変換の修正・意味の塊での分割を行います（要 Gemini APIキー、未設定時は Workers AI）。
               </div>
             </div>
 
@@ -1829,14 +2130,10 @@ export const LeftPanel: React.FC = () => {
                         </div>
 
                         {/* Direct Text Area Editor */}
-                        <textarea
+                        <SubtitleTextEditor
+                          subtitleId={sub.id}
+                          text={sub.text}
                           rows={2}
-                          value={sub.text}
-                          onChange={(e) =>
-                            updateSubtitle(sub.id, { text: e.target.value })
-                          }
-                          placeholder="テロップ文字列を入力..."
-                          className="w-full px-2.5 py-1.5 rounded bg-zinc-950/90 border border-zinc-800 focus:border-cyan-500 focus:outline-none text-xs text-zinc-100 resize-none"
                         />
                       </div>
                     );

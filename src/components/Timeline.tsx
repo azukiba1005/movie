@@ -135,6 +135,7 @@ export const Timeline: React.FC = () => {
   const showCutOverlay = useEditorStore((s) => s.showCutOverlay);
   const cutIntervals = useEditorStore((s) => s.cutIntervals);
   const activeTool = useEditorStore((s) => s.activeTool);
+  const isPlaying = useEditorStore((s) => s.isPlaying);
   const selectedItemType = useEditorStore((s) => s.selectedItemType);
   const selectedItemId = useEditorStore((s) => s.selectedItemId);
   const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
@@ -367,6 +368,47 @@ export const Timeline: React.FC = () => {
     };
   });
 
+  // Auto-scroll: keep the playhead visible while playing (paused while the user drags / scrolls)
+  const userScrollUntilRef = useRef(0);
+  const autoScrollRef = useRef({ left: 0, until: 0 });
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const markUserScroll = () => {
+      userScrollUntilRef.current = performance.now() + 1500;
+    };
+    el.addEventListener('wheel', markUserScroll, { passive: true });
+    el.addEventListener('touchmove', markUserScroll, { passive: true });
+    return () => {
+      el.removeEventListener('wheel', markUserScroll);
+      el.removeEventListener('touchmove', markUserScroll);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPlaying || isScrubbing || dragState) return;
+    if (performance.now() < userScrollUntilRef.current) return;
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const viewW = el.clientWidth;
+    if (viewW <= 0) return;
+    const x = currentTime * zoomPxPerSec;
+    const left = el.scrollLeft;
+    if (x > left + viewW * 0.85) {
+      // Page forward: put the playhead near the left edge of the next page
+      // (do not restart the smooth scroll animation every frame)
+      const target = Math.max(0, x - viewW * 0.15);
+      const prev = autoScrollRef.current;
+      if (performance.now() > prev.until || Math.abs(prev.left - target) > viewW * 0.1) {
+        autoScrollRef.current = { left: target, until: performance.now() + 700 };
+        el.scrollTo({ left: target, behavior: 'smooth' });
+      }
+    } else if (x < left) {
+      // Playhead jumped behind the view (loop / seek)
+      el.scrollTo({ left: Math.max(0, x - viewW * 0.15), behavior: 'auto' });
+    }
+  }, [currentTime, isPlaying, isScrubbing, dragState, zoomPxPerSec]);
+
   // Delete currently selected item on toolbar trash click
   const handleDeleteSelected = () => {
     if (!selectedItemId || !selectedItemType) return;
@@ -433,7 +475,7 @@ export const Timeline: React.FC = () => {
           {/* Split at Playhead */}
           <button
             onClick={splitAtPlayhead}
-            title="再生ヘッド位置でクリップを分割 (S)"
+            title="再生ヘッド位置でクリップを分割 (⌘B / Ctrl+B / S)"
             className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs flex items-center gap-1 transition"
           >
             <Scissors className="w-3.5 h-3.5 text-cyan-400" />

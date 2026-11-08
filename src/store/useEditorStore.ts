@@ -22,6 +22,51 @@ import {
   DEFAULT_AUDIO_EFFECTS,
 } from '../utils/audioEffects';
 
+export type SilencePresetId = 'mild' | 'standard' | 'jet';
+
+/** One-touch silence-cut presets (default: mild = natural conversation, tail protection) */
+export const SILENCE_PRESETS: Record<
+  SilencePresetId,
+  { label: string; description: string; values: Partial<SilenceConfig> }
+> = {
+  mild: {
+    label: 'マイルド',
+    description: '自然な会話・語尾保護',
+    values: {
+      thresholdDb: -38,
+      minSilenceDurationMs: 650,
+      paddingMs: 220,
+      paddingBeforeMs: 180,
+      paddingAfterMs: 250,
+      minSpeechDurationMs: 80,
+    },
+  },
+  standard: {
+    label: '標準',
+    description: 'バランス重視',
+    values: {
+      thresholdDb: -32,
+      minSilenceDurationMs: 400,
+      paddingMs: 120,
+      paddingBeforeMs: 100,
+      paddingAfterMs: 150,
+      minSpeechDurationMs: 120,
+    },
+  },
+  jet: {
+    label: 'ジェットカット',
+    description: 'テンポ重視',
+    values: {
+      thresholdDb: -28,
+      minSilenceDurationMs: 250,
+      paddingMs: 70,
+      paddingBeforeMs: 60,
+      paddingAfterMs: 90,
+      minSpeechDurationMs: 150,
+    },
+  },
+};
+
 export const BUILTIN_FONTS = [
   { label: 'Noto Sans JP (ゴシック標準)', value: '"Noto Sans JP", sans-serif' },
   { label: 'M PLUS Rounded 1c (丸ゴシック)', value: '"M PLUS Rounded 1c", sans-serif' },
@@ -42,13 +87,13 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   align: 'center',
   innerOutline: {
     enabled: true,
-    color: '#000000',
+    color: '#9333ea',
     width: 8,
   },
   outerOutline: {
     enabled: true,
-    color: '#06b6d4',
-    width: 14,
+    color: '#ffffff',
+    width: 10,
   },
   background: {
     enabled: false,
@@ -73,6 +118,34 @@ export const SUBTITLE_STYLE_PRESETS: Array<{
   description: string;
   style: Partial<SubtitleStyle>;
 }> = [
+  {
+    id: 'purple-pop',
+    name: '紫ポップ（白文字×紫縁×白縁）',
+    description: 'デフォルト：鮮やかな紫の二重縁取り',
+    style: {
+      fontFamily: '"Noto Sans JP", sans-serif',
+      fontSize: 56,
+      fontWeight: 900,
+      color: '#FFFFFF',
+      innerOutline: { enabled: true, color: '#9333ea', width: 8 },
+      outerOutline: { enabled: true, color: '#ffffff', width: 10 },
+      background: {
+        enabled: false,
+        color: '#000000',
+        opacity: 0.7,
+        borderRadius: 12,
+        paddingX: 24,
+        paddingY: 12,
+      },
+      shadow: {
+        enabled: true,
+        color: 'rgba(0,0,0,0.85)',
+        blur: 10,
+        offsetX: 0,
+        offsetY: 4,
+      },
+    },
+  },
   {
     id: 'variety-cyan',
     name: 'YouTube王道（白×黒×シアン二重縁）',
@@ -356,8 +429,26 @@ export interface EditorState {
   // Subtitle Actions (Track 1)
   addSubtitle: (item?: Partial<SubtitleItem>) => string;
   setSubtitlesFromTranscription: (
-    segments: Array<{ id: string; start: number; end: number; text: string }>
+    segments: Array<{
+      id: string;
+      start: number;
+      end: number;
+      text: string;
+      groupId?: string;
+    }>
   ) => void;
+  /** Replace all subtitles (one undo step), e.g. after re-format */
+  replaceSubtitles: (
+    items: Array<{
+      start: number;
+      end: number;
+      text: string;
+      style: SubtitleStyle;
+      groupId?: string;
+    }>
+  ) => void;
+  /** Split a subtitle at a text cursor position (time by character ratio) */
+  splitSubtitleAtCursor: (id: string, cursor: number) => void;
   updateSubtitle: (
     id: string,
     patch: Partial<Omit<SubtitleItem, 'style'>> & { style?: Partial<SubtitleStyle> },
@@ -427,13 +518,16 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   selectedItemId: null,
 
   silenceConfig: {
-    thresholdDb: -30,
-    minSilenceDurationMs: 400,
-    paddingMs: 100,
+    thresholdDb: -38,
+    minSilenceDurationMs: 650,
+    paddingMs: 220,
+    paddingBeforeMs: 180,
+    paddingAfterMs: 250,
     autoNormalize: true,
     useVoiceBandFilter: true,
-    minSpeechDurationMs: 150,
+    minSpeechDurationMs: 80,
     detectNoiseByTranscript: true,
+    silencePreset: 'mild',
   },
   cutIntervals: [],
   isTranscribing: false,
@@ -1259,6 +1353,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       startTime: Number(seg.start.toFixed(3)),
       endTime: Number(Math.max(seg.start + 0.3, seg.end).toFixed(3)),
       style: JSON.parse(JSON.stringify(baseStyle)),
+      ...(seg.groupId ? { groupId: seg.groupId } : {}),
     }));
 
     set({
@@ -1267,6 +1362,67 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       selectedItemId: newSubs[0]?.id || null,
       inspectorTab: 'subtitle',
     });
+  },
+
+  replaceSubtitles: (items) => {
+    const state = get();
+    state.saveHistory();
+    const subs: SubtitleItem[] = items.map((it, idx) => ({
+      id: `sub-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 5)}`,
+      text: it.text,
+      startTime: Number(it.start.toFixed(3)),
+      endTime: Number(Math.max(it.start + 0.15, it.end).toFixed(3)),
+      style: JSON.parse(JSON.stringify(it.style)),
+      ...(it.groupId ? { groupId: it.groupId } : {}),
+    }));
+    subs.sort((a, b) => a.startTime - b.startTime);
+    set({
+      subtitles: subs,
+      selectedItemType: subs.length > 0 ? 'subtitle' : null,
+      selectedItemId: subs[0]?.id || null,
+      inspectorTab: 'subtitle',
+    });
+  },
+
+  splitSubtitleAtCursor: (id, cursor) => {
+    const state = get();
+    const target = state.subtitles.find((s) => s.id === id);
+    if (!target) return;
+    const left = target.text.slice(0, cursor).replace(/^[\s\n]+|[\s\n]+$/g, '');
+    const right = target.text.slice(cursor).replace(/^[\s\n]+|[\s\n]+$/g, '');
+    if (!left || !right) {
+      state.setStatusNotification('カーソルを文字の途中に置いてください（先頭・末尾では分割できません）');
+      return;
+    }
+    const lc = left.replace(/\n/g, '').length;
+    const rc = right.replace(/\n/g, '').length;
+    const dur = target.endTime - target.startTime;
+    const minPart = Math.min(0.15, dur / 3);
+    const mid = Number(
+      Math.max(
+        target.startTime + minPart,
+        Math.min(target.endTime - minPart, target.startTime + (dur * lc) / (lc + rc))
+      ).toFixed(3)
+    );
+    state.saveHistory();
+    const groupId =
+      target.groupId || `grp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
+    const first: SubtitleItem = { ...target, text: left, endTime: mid, groupId };
+    const second: SubtitleItem = {
+      ...JSON.parse(JSON.stringify(target)),
+      id: `sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      text: right,
+      startTime: mid,
+      endTime: target.endTime,
+      groupId,
+    };
+    set((s) => ({
+      subtitles: s.subtitles
+        .flatMap((item) => (item.id === id ? [first, second] : [item]))
+        .sort((a, b) => a.startTime - b.startTime),
+      selectedItemType: 'subtitle',
+      selectedItemId: second.id,
+    }));
   },
 
   updateSubtitle: (id, patch, recordHistory = false) => {

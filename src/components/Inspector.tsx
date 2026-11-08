@@ -22,6 +22,7 @@ import {
   useEditorStore,
 } from '../store/useEditorStore';
 import { SubtitleStyle } from '../types/editor';
+import { SubtitleTextEditor } from './SubtitleTextEditor';
 import {
   AUDIO_EFFECT_PRESETS,
   computeAutoMakeupDb,
@@ -384,14 +385,12 @@ export const Inspector: React.FC = () => {
               </div>
 
               {targetSubtitle && (
-                <textarea
+                <SubtitleTextEditor
+                  subtitleId={targetSubtitle.id}
+                  text={targetSubtitle.text}
                   rows={2}
-                  value={targetSubtitle.text}
-                  onChange={(e) =>
-                    updateSubtitle(targetSubtitle.id, { text: e.target.value })
-                  }
-                  className="w-full px-2.5 py-1.5 rounded bg-zinc-950 border border-zinc-700 focus:border-cyan-500 focus:outline-none text-xs text-zinc-100 resize-none"
                   placeholder="テロップ文字列..."
+                  className="w-full px-2.5 py-1.5 rounded bg-zinc-950 border border-zinc-700 focus:border-cyan-500 focus:outline-none text-xs text-zinc-100 resize-none"
                 />
               )}
 

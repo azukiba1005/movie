@@ -51,6 +51,8 @@ export interface SubtitleItem {
   startTime: number; // timeline seconds
   endTime: number; // timeline seconds
   style: SubtitleStyle;
+  /** Subtitles split from the same Whisper segment share a groupId (used by re-format) */
+  groupId?: string;
 }
 
 export interface VideoClip {
@@ -177,7 +179,13 @@ export interface CustomFontAsset {
 export interface SilenceConfig {
   thresholdDb: number; // e.g. -32 dB
   minSilenceDurationMs: number; // e.g. 400 ms
-  paddingMs: number; // e.g. 100 ms before & after speech
+  paddingMs: number; // e.g. 100 ms before & after speech (fallback for the two fields below)
+  /** Protect the head of speech: margin kept before the next speech starts (ms) */
+  paddingBeforeMs?: number;
+  /** Protect the tail of speech: margin kept after speech ends (ms) */
+  paddingAfterMs?: number;
+  /** Which one-touch preset is active ('custom' once a slider is touched) */
+  silencePreset?: 'mild' | 'standard' | 'jet' | 'custom';
   /** When true (default), evaluates dB relative to the video's normalized peak (0dB = max volume) */
   autoNormalize?: boolean;
   /** Judge silence on the 300–3000Hz voice band (default true; needs voiceBandRms) */

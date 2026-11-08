@@ -41,6 +41,13 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Split at playhead: Cmd+B (Mac) / Ctrl+B (Win), like DaVinci Resolve
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        state.splitAtPlayhead();
+        return;
+      }
+
       // Play / Pause: Space
       if (e.code === 'Space') {
         e.preventDefault();

@@ -30,6 +30,7 @@ import {
   getCanvasDimensions,
   renderCameraMonitorFrame,
   renderCompositeFrame,
+  FrameLayerCache,
 } from '../utils/canvasRenderer';
 
 /**
@@ -69,6 +70,27 @@ function ensureAudioGraph(
   } catch (err) {
     console.warn('Web Audio graph setup failed, falling back to plain playback', err);
     return null;
+  }
+}
+
+/**
+ * Throttled seek: never re-assign currentTime while the previous seek is still running
+ * (unless it has been pending for 50ms+), and never more often than every 30ms.
+ * Constantly seeking keeps <video> in "seeking" state and makes the preview flicker.
+ */
+const lastSeekAt = new WeakMap<HTMLMediaElement, number>();
+function throttledSeek(el: HTMLMediaElement, time: number): boolean {
+  const now = performance.now();
+  const last = lastSeekAt.get(el) ?? 0;
+  const elapsed = now - last;
+  if (elapsed < 30) return false;
+  if (el.seeking && elapsed < 50) return false;
+  try {
+    el.currentTime = Math.max(0, time);
+    lastSeekAt.set(el, now);
+    return true;
+  } catch {
+    return false; // metadata not loaded yet
   }
 }
 
@@ -124,6 +146,8 @@ export const PreviewPlayer: React.FC = () => {
   const activeBgmUrlRef = useRef<string>('');
   const activeClipIdRef = useRef<string | null>(null);
   const rafRef = useRef<number | null>(null);
+  // Last valid video frame (shown while seeking / decoding so the canvas never blanks)
+  const layerCacheRef = useRef<FrameLayerCache>({ canvas: null, valid: false });
   const lastFramePerfRef = useRef<number>(0);
 
   // Dragging subtitle directly on Canvas
@@ -202,17 +226,20 @@ export const PreviewPlayer: React.FC = () => {
               }
             }
 
-            const driftThreshold = playing ? 0.22 * safeRate : 0.03;
-            if (
-              Math.abs(videoEl.currentTime - targetSourceTime) >
-                driftThreshold ||
-              activeClipIdRef.current !== activeClip.id
-            ) {
-              try {
-                videoEl.currentTime = Math.max(0, targetSourceTime);
-              } catch {
-                // Ignore if metadata not yet loaded
+            // While playing, let the <video> play natively: only correct on a clip switch
+            // (small tolerance) or when the drift exceeds ~0.15s. Paused: follow the playhead.
+            const clipChanged = activeClipIdRef.current !== activeClip.id;
+            const driftThreshold = playing
+              ? clipChanged
+                ? 0.05
+                : 0.15 * Math.max(1, safeRate)
+              : 0.03;
+            const drift = Math.abs(videoEl.currentTime - targetSourceTime);
+            if (drift > driftThreshold) {
+              if (throttledSeek(videoEl, targetSourceTime)) {
+                activeClipIdRef.current = activeClip.id;
               }
+            } else {
               activeClipIdRef.current = activeClip.id;
             }
 
@@ -261,13 +288,9 @@ export const PreviewPlayer: React.FC = () => {
           if (t2 < 0 || t2 >= asset2.duration) {
             if (!cam2El.paused) cam2El.pause();
           } else {
-            const drift2 = playing ? 0.22 * rate2 : 0.03;
+            const drift2 = playing ? 0.15 * Math.max(1, rate2) : 0.03;
             if (Math.abs(cam2El.currentTime - t2) > drift2) {
-              try {
-                cam2El.currentTime = Math.max(0, t2);
-              } catch {
-                // metadata not ready yet
-              }
+              throttledSeek(cam2El, t2);
             }
             if (playing && cam2El.paused && cam2El.readyState >= 2) {
               cam2El.play().catch(() => {});
@@ -315,11 +338,7 @@ export const PreviewPlayer: React.FC = () => {
             );
 
             if (Math.abs(bgmEl.currentTime - targetBgmSource) > 0.25) {
-              try {
-                bgmEl.currentTime = Math.max(0, targetBgmSource);
-              } catch {
-                // Ignore
-              }
+              throttledSeek(bgmEl, targetBgmSource);
             }
 
             if (playing && bgmEl.paused && bgmEl.readyState >= 2) {
@@ -352,6 +371,9 @@ export const PreviewPlayer: React.FC = () => {
       if (!ctx) return;
 
       const activeClip = getActiveClipAt(t);
+      if (useEditorStore.getState().videoClips.length === 0) {
+        layerCacheRef.current.valid = false; // nothing left to hold
+      }
       const asset = activeClip
         ? mediaAssets.find((m) => m.id === activeClip.mediaId)
         : undefined;
@@ -362,17 +384,18 @@ export const PreviewPlayer: React.FC = () => {
       const asset2 = cam2MediaId
         ? mediaAssets.find((m) => m.id === cam2MediaId)
         : undefined;
-      let cam2Usable = false;
+      let cam2InRange = false;
       if (activeClip && cam2El && asset2 && !asset2.missingFile) {
         const t2 =
           activeClip.sourceStart +
           (t - activeClip.startTime) * activeClip.speed +
           cam2Offset;
-        cam2Usable =
-          t2 >= 0 && t2 < asset2.duration && cam2El.readyState >= 2;
+        cam2InRange = t2 >= 0 && t2 < asset2.duration;
       }
+      const cam2Usable = cam2InRange && Boolean(cam2El && cam2El.readyState >= 2);
+      // Stay on Cam 2 while it is still decoding (the cached frame is held) instead of flashing Cam 1
       const programVideo =
-        activeClip?.cameraAngle === 2 && cam2Usable ? cam2El : cam1El;
+        activeClip?.cameraAngle === 2 && cam2InRange ? cam2El : cam1El;
 
       renderCompositeFrame({
         ctx,
@@ -385,6 +408,7 @@ export const PreviewPlayer: React.FC = () => {
         subtitles,
         showSafeZone,
         missingVideoFile: Boolean(asset?.missingFile),
+        layerCache: layerCacheRef.current,
       });
 
       if (multicamMode) {
