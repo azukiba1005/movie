@@ -45,6 +45,7 @@ export async function exportProjectToZip(
       waveformPeaks: asset.waveformPeaks,
       waveformSampleRate: asset.waveformSampleRate,
       rawWaveformRms: asset.rawWaveformRms,
+      voiceBandRms: asset.voiceBandRms,
       audioStats: asset.audioStats,
       includedInZip: shouldInclude,
       zipPath,
@@ -79,6 +80,7 @@ export async function exportProjectToZip(
     silenceConfig: state.silenceConfig,
     cam2MediaId: state.cam2MediaId,
     cam2Offset: state.cam2Offset,
+    audioEffects: state.audioEffects,
     mediaMetadata,
     fontMetadata,
   };
@@ -261,6 +263,7 @@ export async function importProjectFromZip(
         waveformPeaks: meta.waveformPeaks || [],
         waveformSampleRate: meta.waveformSampleRate || 50,
         rawWaveformRms: meta.rawWaveformRms,
+        voiceBandRms: meta.voiceBandRms,
         audioStats: meta.audioStats,
         missingFile: false,
       });
@@ -282,6 +285,7 @@ export async function importProjectFromZip(
         waveformPeaks: meta.waveformPeaks || [],
         waveformSampleRate: meta.waveformSampleRate || 50,
         rawWaveformRms: meta.rawWaveformRms,
+        voiceBandRms: meta.voiceBandRms,
         audioStats: meta.audioStats,
         missingFile: true,
       });
@@ -299,13 +303,14 @@ export async function importProjectFromZip(
     bgmClips: projectData.bgmClips || [],
     defaultSubtitleStyle:
       projectData.defaultSubtitleStyle || store.defaultSubtitleStyle,
-    silenceConfig: projectData.silenceConfig || store.silenceConfig,
+    silenceConfig: { ...store.silenceConfig, ...(projectData.silenceConfig || {}) },
     cam2MediaId:
       projectData.cam2MediaId &&
       restoredMedia.some((m) => m.id === projectData.cam2MediaId)
         ? projectData.cam2MediaId
         : null,
     cam2Offset: projectData.cam2Offset ?? 0,
+    audioEffects: projectData.audioEffects,
   });
 
   onProgress?.(100, 'プロジェクトの読み込みが完了しました');

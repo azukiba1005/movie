@@ -1,4 +1,10 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+} from 'react';
 import {
   Play,
   Pause,
@@ -14,10 +20,57 @@ import {
 } from 'lucide-react';
 import { useEditorStore } from '../store/useEditorStore';
 import {
+  createEffectChain,
+  EffectChain,
+  gainReductionMeter,
+  getMasterAudioStats,
+  resolveMakeupDb,
+} from '../utils/audioEffects';
+import {
   getCanvasDimensions,
   renderCameraMonitorFrame,
   renderCompositeFrame,
 } from '../utils/canvasRenderer';
+
+/**
+ * One AudioContext graph per <video> element (createMediaElementSource may only be called once per element):
+ *   source -> preGain (clip volume / mute) -> [effect chain] -> destination
+ */
+interface ElementAudioGraph {
+  ctx: AudioContext;
+  preGain: GainNode;
+  chain: EffectChain;
+  chainEnabled: boolean;
+}
+const elementAudioGraphs = new WeakMap<HTMLMediaElement, ElementAudioGraph>();
+
+function ensureAudioGraph(
+  el: HTMLMediaElement,
+  fx: Parameters<typeof createEffectChain>[1],
+  makeupDb: number
+): ElementAudioGraph | null {
+  const existing = elementAudioGraphs.get(el);
+  if (existing) return existing;
+  try {
+    const Ctor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    const ctx = new Ctor();
+    const source = ctx.createMediaElementSource(el);
+    const preGain = ctx.createGain();
+    const chain = createEffectChain(ctx, fx, makeupDb);
+    source.connect(preGain);
+    chain.output.connect(ctx.destination);
+    preGain.connect(ctx.destination);
+    const graph: ElementAudioGraph = { ctx, preGain, chain, chainEnabled: false };
+    elementAudioGraphs.set(el, graph);
+    return graph;
+  } catch (err) {
+    console.warn('Web Audio graph setup failed, falling back to plain playback', err);
+    return null;
+  }
+}
 
 export function formatTimecode(seconds: number, fps = 30): string {
   const safeSec = Math.max(0, seconds || 0);
@@ -48,6 +101,7 @@ export const PreviewPlayer: React.FC = () => {
   const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
   const cam2Offset = useEditorStore((s) => s.cam2Offset);
   const multicamMode = useEditorStore((s) => s.multicamMode);
+  const audioEffects = useEditorStore((s) => s.audioEffects);
 
   const setMulticamMode = useEditorStore((s) => s.setMulticamMode);
   const liveSwitchAngle = useEditorStore((s) => s.liveSwitchAngle);
@@ -127,11 +181,25 @@ export const PreviewPlayer: React.FC = () => {
               videoEl.playbackRate = safeRate;
             }
 
-            const effectiveVol = activeClip.muted
-              ? 0
-              : Math.max(0, Math.min(1, activeClip.volume));
-            if (Math.abs(videoEl.volume - effectiveVol) > 0.01) {
-              videoEl.volume = effectiveVol;
+            const audioGraph = elementAudioGraphs.get(videoEl);
+            if (audioGraph) {
+              // Volume (0..200%) is applied by the graph's pre-gain
+              if (videoEl.volume !== 1) videoEl.volume = 1;
+              const clipVol = activeClip.muted
+                ? 0
+                : Math.max(0, Math.min(2, activeClip.volume));
+              audioGraph.preGain.gain.setTargetAtTime(
+                clipVol,
+                audioGraph.ctx.currentTime,
+                0.01
+              );
+            } else {
+              const effectiveVol = activeClip.muted
+                ? 0
+                : Math.max(0, Math.min(1, activeClip.volume));
+              if (Math.abs(videoEl.volume - effectiveVol) > 0.01) {
+                videoEl.volume = effectiveVol;
+              }
             }
 
             const driftThreshold = playing ? 0.22 * safeRate : 0.03;
@@ -356,6 +424,38 @@ export const PreviewPlayer: React.FC = () => {
     ]
   );
 
+  // Master audio effect chain (compressor / loudness) for the Cam 1 <video> element
+  const masterStats = useMemo(
+    () => getMasterAudioStats(videoClips, mediaAssets, cam2MediaId),
+    [videoClips, mediaAssets, cam2MediaId]
+  );
+  const makeupDb = resolveMakeupDb(audioEffects, masterStats);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    const graph = ensureAudioGraph(el, audioEffects, makeupDb);
+    if (!graph) return;
+    // (Re)route only when the ON/OFF state changes; parameters are updated live without stopping playback
+    if (graph.chainEnabled !== audioEffects.compressorEnabled) {
+      graph.preGain.disconnect();
+      graph.preGain.connect(
+        audioEffects.compressorEnabled ? graph.chain.input : graph.ctx.destination
+      );
+      graph.chainEnabled = audioEffects.compressorEnabled;
+    }
+    graph.chain.update(audioEffects, makeupDb, true);
+  }, [audioEffects, makeupDb]);
+
+  // AudioContext starts suspended until a user gesture: resume on play
+  useEffect(() => {
+    const el = videoRef.current;
+    const graph = el ? elementAudioGraphs.get(el) : undefined;
+    if (isPlaying && graph && graph.ctx.state === 'suspended') {
+      graph.ctx.resume().catch(() => {});
+    }
+  }, [isPlaying]);
+
   // Main 60fps requestAnimationFrame loop
   useEffect(() => {
     lastFramePerfRef.current = performance.now();
@@ -386,6 +486,14 @@ export const PreviewPlayer: React.FC = () => {
         syncMediaElements(state.currentTime, false);
         drawCurrentFrame(state.currentTime);
       }
+
+      // Gain-reduction meter feed (compressor.reduction is <= 0 dB)
+      const meterEl = videoRef.current;
+      const meterGraph = meterEl ? elementAudioGraphs.get(meterEl) : undefined;
+      gainReductionMeter.valueDb =
+        meterGraph && meterGraph.chainEnabled && state.isPlaying
+          ? Math.min(0, meterGraph.chain.compressor.reduction)
+          : 0;
 
       rafRef.current = requestAnimationFrame(tick);
     };
@@ -488,7 +596,11 @@ export const PreviewPlayer: React.FC = () => {
           )}
           {activeCutCandidate && (
             <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[11px] font-medium animate-pulse">
-              カット候補区間 ({activeCutCandidate.type === 'silence' ? '無音' : 'AI検出'})
+              カット候補区間 ({activeCutCandidate.type === 'silence'
+                ? '無音'
+                : activeCutCandidate.type === 'noise'
+                ? 'ノイズ/咳・打鍵音'
+                : 'AI検出'})
             </span>
           )}
         </div>

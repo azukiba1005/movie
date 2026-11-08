@@ -831,7 +831,11 @@ export const Timeline: React.FC = () => {
                         setCurrentTime(ci.start);
                       }}
                       title={`${
-                        ci.type === 'silence' ? '無音区間' : 'AI検出区間'
+                        ci.type === 'silence'
+                          ? '無音区間'
+                          : ci.type === 'noise'
+                          ? 'ノイズ区間'
+                          : 'AI検出区間'
                       }: ${ci.reason || ''}`}
                       className={`absolute top-1 bottom-1 rounded pointer-events-auto cursor-pointer border z-15 flex items-center justify-center overflow-hidden ${
                         ci.selected
@@ -840,7 +844,11 @@ export const Timeline: React.FC = () => {
                       }`}
                     >
                       <span className="text-[9px] font-bold text-rose-100 bg-rose-950/80 px-1 rounded truncate">
-                        {ci.type === 'silence' ? '無音' : 'AIカット'}
+                        {ci.type === 'silence'
+                          ? '無音'
+                          : ci.type === 'noise'
+                          ? 'ノイズ'
+                          : 'AIカット'}
                       </span>
                     </div>
                   );

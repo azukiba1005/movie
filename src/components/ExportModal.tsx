@@ -23,6 +23,7 @@ export const ExportModal: React.FC = () => {
   const bgmClips = useEditorStore((s) => s.bgmClips);
   const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
   const cam2Offset = useEditorStore((s) => s.cam2Offset);
+  const audioEffects = useEditorStore((s) => s.audioEffects);
 
   const setExportModalOpen = useEditorStore((s) => s.setExportModalOpen);
   const setStatusNotification = useEditorStore((s) => s.setStatusNotification);
@@ -60,6 +61,7 @@ export const ExportModal: React.FC = () => {
         bgmClips,
         cam2MediaId,
         cam2Offset,
+        audioEffects,
         signal: controller.signal,
         onProgress: (pct, text) => {
           setProgress(pct);

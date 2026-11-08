@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import {
   ActiveTool,
+  AudioEffectPreset,
+  AudioEffectsSettings,
   AspectRatioType,
   BgmClip,
   CustomFontAsset,
@@ -14,6 +16,11 @@ import {
   SubtitleStyle,
   VideoClip,
 } from '../types/editor';
+
+import {
+  AUDIO_EFFECT_PRESETS,
+  DEFAULT_AUDIO_EFFECTS,
+} from '../utils/audioEffects';
 
 export const BUILTIN_FONTS = [
   { label: 'Noto Sans JP (ゴシック標準)', value: '"Noto Sans JP", sans-serif' },
@@ -232,6 +239,9 @@ export interface EditorState {
   bgmClips: BgmClip[]; // Track 3 (BGM)
   defaultSubtitleStyle: SubtitleStyle;
 
+  // Master audio effects (compressor / loudness)
+  audioEffects: AudioEffectsSettings;
+
   // Multicam (Cam 1 = main + master audio, Cam 2 = sub video only)
   cam2MediaId: string | null;
   /** cam2 media time = cam1 media source time + cam2Offset (seconds) */
@@ -311,6 +321,10 @@ export interface EditorState {
   registerCustomFont: (fontAsset: CustomFontAsset) => Promise<void>;
   removeCustomFont: (fontId: string) => void;
 
+  // Audio effects Actions
+  setAudioEffects: (patch: Partial<AudioEffectsSettings>) => void;
+  applyAudioPreset: (preset: Exclude<AudioEffectPreset, 'custom'>) => void;
+
   // Multicam Actions
   setCam2MediaId: (mediaId: string | null) => void;
   setCam2Offset: (offset: number) => void;
@@ -373,6 +387,7 @@ export interface EditorState {
     silenceConfig: SilenceConfig;
     cam2MediaId?: string | null;
     cam2Offset?: number;
+    audioEffects?: Partial<AudioEffectsSettings>;
   }) => void;
 }
 
@@ -390,6 +405,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   subtitles: [],
   bgmClips: [],
   defaultSubtitleStyle: JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_STYLE)),
+
+  audioEffects: { ...DEFAULT_AUDIO_EFFECTS },
 
   cam2MediaId: null,
   cam2Offset: 0,
@@ -414,6 +431,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     minSilenceDurationMs: 400,
     paddingMs: 100,
     autoNormalize: true,
+    useVoiceBandFilter: true,
+    minSpeechDurationMs: 150,
+    detectNoiseByTranscript: true,
   },
   cutIntervals: [],
   isTranscribing: false,
@@ -660,6 +680,44 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   removeCustomFont: (fontId) => {
     set((state) => ({
       customFonts: state.customFonts.filter((f) => f.id !== fontId),
+    }));
+  },
+
+  setAudioEffects: (patch) => {
+    set((state) => {
+      // Manually touching any tone parameter switches the preset to 'custom'
+      const touchesParams = (
+        [
+          'threshold',
+          'ratio',
+          'knee',
+          'attack',
+          'release',
+          'makeupGain',
+          'autoMakeup',
+          'voiceClarityEq',
+        ] as const
+      ).some((k) => k in patch);
+      return {
+        audioEffects: {
+          ...state.audioEffects,
+          ...patch,
+          ...(touchesParams && !('preset' in patch)
+            ? { preset: 'custom' as const }
+            : {}),
+        },
+      };
+    });
+  },
+
+  applyAudioPreset: (preset) => {
+    set((state) => ({
+      audioEffects: {
+        ...state.audioEffects,
+        ...AUDIO_EFFECT_PRESETS[preset].values,
+        preset,
+        compressorEnabled: true,
+      },
     }));
   },
 
@@ -1436,6 +1494,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       bgmClips: payload.bgmClips,
       defaultSubtitleStyle: payload.defaultSubtitleStyle,
       silenceConfig: payload.silenceConfig,
+      audioEffects: { ...DEFAULT_AUDIO_EFFECTS, ...(payload.audioEffects || {}) },
       cam2MediaId: payload.cam2MediaId ?? null,
       cam2Offset: payload.cam2Offset ?? 0,
       multicamMode: false,

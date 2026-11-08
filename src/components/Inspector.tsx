@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Sliders,
   Type,
@@ -22,6 +22,257 @@ import {
   useEditorStore,
 } from '../store/useEditorStore';
 import { SubtitleStyle } from '../types/editor';
+import {
+  AUDIO_EFFECT_PRESETS,
+  computeAutoMakeupDb,
+  gainReductionMeter,
+  getMasterAudioStats,
+} from '../utils/audioEffects';
+
+/** Real-time gain reduction bar (0..20 dB), fed by the preview player's compressor node */
+const GainReductionMeter: React.FC = () => {
+  const [reduction, setReduction] = useState(0);
+  useEffect(() => {
+    let raf = 0;
+    let smoothed = 0;
+    const loop = () => {
+      const target = Math.abs(gainReductionMeter.valueDb);
+      // fast attack, slower release for a readable meter
+      smoothed = target > smoothed ? target : smoothed * 0.88 + target * 0.12;
+      setReduction((prev) =>
+        Math.abs(prev - smoothed) > 0.1 ? smoothed : prev
+      );
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  const pct = Math.min(100, (reduction / 20) * 100);
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-[11px]">
+        <span className="text-zinc-400">ゲインリダクション（抑え込み量）</span>
+        <span className="font-mono text-amber-300">
+          -{reduction.toFixed(1)} dB
+        </span>
+      </div>
+      <div className="h-2.5 rounded bg-zinc-950 border border-zinc-800 overflow-hidden relative">
+        <div
+          className="h-full bg-gradient-to-r from-emerald-500 via-amber-400 to-rose-500"
+          style={{ width: `${pct}%`, transition: 'width 60ms linear' }}
+        />
+      </div>
+      <div className="flex justify-between text-[9px] font-mono text-zinc-600">
+        <span>0</span>
+        <span>-5</span>
+        <span>-10</span>
+        <span>-15</span>
+        <span>-20 dB</span>
+      </div>
+    </div>
+  );
+};
+
+const AudioEffectsSection: React.FC = () => {
+  const fx = useEditorStore((s) => s.audioEffects);
+  const setAudioEffects = useEditorStore((s) => s.setAudioEffects);
+  const applyAudioPreset = useEditorStore((s) => s.applyAudioPreset);
+  const videoClips = useEditorStore((s) => s.videoClips);
+  const mediaAssets = useEditorStore((s) => s.mediaAssets);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+
+  const autoDb = useMemo(
+    () =>
+      computeAutoMakeupDb(
+        fx,
+        getMasterAudioStats(videoClips, mediaAssets, cam2MediaId)
+      ),
+    [fx, videoClips, mediaAssets, cam2MediaId]
+  );
+
+  const slider = (
+    label: string,
+    value: number,
+    min: number,
+    max: number,
+    step: number,
+    fmt: (v: number) => string,
+    onChange: (v: number) => void,
+    disabled = false
+  ) => (
+    <div className={disabled ? 'opacity-40' : ''}>
+      <div className="flex justify-between text-[11px] mb-1">
+        <span className="text-zinc-400">{label}</span>
+        <span className="font-mono text-cyan-300">{fmt(value)}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-cyan-500 h-1.5 bg-zinc-800 rounded-lg"
+      />
+    </div>
+  );
+
+  const presetBtn = (
+    active: boolean,
+    label: string,
+    onClick: () => void,
+    title?: string
+  ) => (
+    <button
+      onClick={onClick}
+      title={title}
+      className={`py-1.5 px-1 rounded border text-[11px] font-semibold leading-tight transition ${
+        active
+          ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200'
+          : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-cyan-500/30 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-bold text-zinc-100 flex items-center gap-1.5">
+          <Volume2 className="w-4 h-4 text-cyan-400" />
+          <span>オーディオ整音・コンプレッサー</span>
+        </div>
+        <span
+          className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+            fx.compressorEnabled
+              ? 'bg-emerald-500/20 text-emerald-300'
+              : 'bg-zinc-800 text-zinc-500'
+          }`}
+        >
+          {fx.compressorEnabled ? 'ON' : 'OFF'}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-1.5">
+        {presetBtn(!fx.compressorEnabled, 'OFF', () =>
+          setAudioEffects({ compressorEnabled: false })
+        )}
+        {presetBtn(
+          fx.compressorEnabled && fx.preset === 'youtube_voice',
+          '標準トーク（YouTube最適）',
+          () => applyAudioPreset('youtube_voice'),
+          AUDIO_EFFECT_PRESETS.youtube_voice.description
+        )}
+        {presetBtn(
+          fx.compressorEnabled && fx.preset === 'strong_leveler',
+          '強め均一化（小声〜大声の差を無くす）',
+          () => applyAudioPreset('strong_leveler'),
+          AUDIO_EFFECT_PRESETS.strong_leveler.description
+        )}
+        {presetBtn(
+          fx.compressorEnabled && fx.preset === 'soft',
+          'ナチュラル',
+          () => applyAudioPreset('soft'),
+          AUDIO_EFFECT_PRESETS.soft.description
+        )}
+        <div className="col-span-2">
+          {presetBtn(
+            fx.compressorEnabled && fx.preset === 'custom',
+            'カスタム',
+            () => setAudioEffects({ compressorEnabled: true, preset: 'custom' })
+          )}
+        </div>
+      </div>
+
+      <GainReductionMeter />
+
+      <div className={`space-y-2.5 ${fx.compressorEnabled ? '' : 'opacity-50'}`}>
+        {slider('スレッショルド', fx.threshold, -60, 0, 1, (v) => `${v} dB`, (v) =>
+          setAudioEffects({ threshold: v })
+        )}
+        {slider('レシオ', fx.ratio, 1, 20, 0.5, (v) => `${v} : 1`, (v) =>
+          setAudioEffects({ ratio: v })
+        )}
+        {slider('ニー', fx.knee, 0, 40, 1, (v) => `${v} dB`, (v) =>
+          setAudioEffects({ knee: v })
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          {slider(
+            'アタック',
+            fx.attack,
+            0.001,
+            0.2,
+            0.001,
+            (v) => `${Math.round(v * 1000)} ms`,
+            (v) => setAudioEffects({ attack: v })
+          )}
+          {slider(
+            'リリース',
+            fx.release,
+            0.05,
+            1.0,
+            0.01,
+            (v) => `${Math.round(v * 1000)} ms`,
+            (v) => setAudioEffects({ release: v })
+          )}
+        </div>
+        {slider(
+          fx.autoMakeup ? 'メイクアップゲイン（自動）' : 'メイクアップゲイン',
+          fx.autoMakeup && autoDb !== null ? autoDb : fx.makeupGain,
+          0,
+          24,
+          0.5,
+          (v) => `+${v.toFixed(1)} dB`,
+          (v) => setAudioEffects({ makeupGain: v }),
+          fx.autoMakeup && autoDb !== null
+        )}
+
+        <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={fx.autoMakeup}
+            onChange={(e) => setAudioEffects({ autoMakeup: e.target.checked })}
+            className="mt-0.5 accent-cyan-500 rounded cursor-pointer"
+          />
+          <div className="text-[11px] leading-snug">
+            <div className="font-semibold text-zinc-200">
+              自動音量最大化（オートゲイン）
+            </div>
+            <div className="text-[10px] text-zinc-400 mt-0.5">
+              波形解析のピーク/RMSから、音割れしない最大音量（約 -14 LUFS 相当・ピーク約 -2dB）へ自動補正します。
+              {fx.autoMakeup &&
+                (autoDb === null
+                  ? '（音声解析待ち：手動値を使用中）'
+                  : `（現在 +${autoDb.toFixed(1)} dB）`)}
+            </div>
+          </div>
+        </label>
+
+        <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={fx.voiceClarityEq}
+            onChange={(e) =>
+              setAudioEffects({ voiceClarityEq: e.target.checked })
+            }
+            className="mt-0.5 accent-cyan-500 rounded cursor-pointer"
+          />
+          <div className="text-[11px] leading-snug">
+            <div className="font-semibold text-zinc-200">声質クリア化EQ</div>
+            <div className="text-[10px] text-zinc-400 mt-0.5">
+              100Hzハイパスでこもりを除去し、3kHz付近を+3dBブーストして声の抜けを良くします。
+            </div>
+          </div>
+        </label>
+      </div>
+      <div className="text-[10px] text-zinc-500 leading-relaxed">
+        メイン動画（Cam 1）の音声にのみ適用され、MP4書き出しにも同じ処理が反映されます（BGMは対象外）。
+      </div>
+    </div>
+  );
+};
 
 export const Inspector: React.FC = () => {
   const inspectorTab = useEditorStore((s) => s.inspectorTab);
@@ -797,6 +1048,8 @@ export const Inspector: React.FC = () => {
         {/* ================= TAB 2: VIDEO CLIP & BGM INSPECTOR ================= */}
         {inspectorTab === 'clip' && (
           <>
+            <AudioEffectsSection />
+
             {/* BGM Clip Settings (when BGM is selected) */}
             {targetBgmClip && (
               <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-emerald-500/30 space-y-3">

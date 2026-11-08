@@ -94,6 +94,34 @@ export interface BgmClip {
   fadeOut: number; // seconds
 }
 
+export type AudioEffectPreset =
+  | 'youtube_voice'
+  | 'strong_leveler'
+  | 'soft'
+  | 'custom';
+
+/** Master audio (Cam 1 / main clips) compressor + loudness settings */
+export interface AudioEffectsSettings {
+  compressorEnabled: boolean;
+  preset: AudioEffectPreset;
+  /** dB, -60..0 */
+  threshold: number;
+  /** :1, 1..20 */
+  ratio: number;
+  /** dB, 0..40 */
+  knee: number;
+  /** seconds, 0.001..0.2 */
+  attack: number;
+  /** seconds, 0.05..1.0 */
+  release: number;
+  /** dB, 0..24 (ignored when autoMakeup is on) */
+  makeupGain: number;
+  /** Auto-raise level from waveform analysis to ~-14 LUFS-equivalent without clipping */
+  autoMakeup: boolean;
+  /** 100Hz high-pass + 3kHz presence boost */
+  voiceClarityEq: boolean;
+}
+
 export interface AudioLevelStats {
   /** Raw maximum peak level in dBFS (e.g. -3.2 dB) */
   rawPeakDb: number;
@@ -125,6 +153,8 @@ export interface MediaAsset {
   waveformSampleRate: number; // windows per second (e.g. 50)
   /** Raw un-normalized RMS waveform values (0..1) */
   rawWaveformRms?: number[];
+  /** Raw RMS of the voice band (300–3000Hz band-passed) — attenuates keyboard/desk noise. Same rate as waveformPeaks */
+  voiceBandRms?: number[];
   /** Measured audio level statistics (max dB, mean dB, noise floor, suggested threshold) */
   audioStats?: AudioLevelStats;
   /** Error message if audio track decoding failed */
@@ -150,14 +180,20 @@ export interface SilenceConfig {
   paddingMs: number; // e.g. 100 ms before & after speech
   /** When true (default), evaluates dB relative to the video's normalized peak (0dB = max volume) */
   autoNormalize?: boolean;
+  /** Judge silence on the 300–3000Hz voice band (default true; needs voiceBandRms) */
+  useVoiceBandFilter?: boolean;
+  /** Voiced runs shorter than this are treated as noise (keyboard / click / cough) and absorbed into silence. Default 150 */
+  minSpeechDurationMs?: number;
+  /** Also detect loud non-speech noise in gaps with no subtitles (needs subtitles). Default true */
+  detectNoiseByTranscript?: boolean;
 }
 
 export interface CutInterval {
   id: string;
   start: number; // timeline seconds
   end: number; // timeline seconds
-  type: 'silence' | 'ai';
-  category?: 'retake' | 'filler' | 'tangent' | 'silence';
+  type: 'silence' | 'ai' | 'noise';
+  category?: 'retake' | 'filler' | 'tangent' | 'silence' | 'noise';
   reason?: string;
   text?: string;
   confidence?: number;
@@ -173,6 +209,7 @@ export interface EditorHistorySnapshot {
 }
 
 export interface SerializedProjectJson {
+  audioEffects?: AudioEffectsSettings;
   /** Multicam: media id of Cam 2 and its offset (cam2 time = cam1 source time + cam2Offset) */
   cam2MediaId?: string | null;
   cam2Offset?: number;
@@ -198,6 +235,7 @@ export interface SerializedProjectJson {
     waveformPeaks: number[];
     waveformSampleRate: number;
     rawWaveformRms?: number[];
+    voiceBandRms?: number[];
     audioStats?: AudioLevelStats;
     includedInZip: boolean;
     zipPath?: string;

@@ -3,6 +3,7 @@ import {
   CutInterval,
   MediaAsset,
   SilenceConfig,
+  SubtitleItem,
   VideoClip,
 } from '../types/editor';
 
@@ -82,8 +83,72 @@ const MAX_DECODE_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
 /** Peak below this is treated as "all zero" (decode/scan silently failed) */
 const ZERO_PEAK_EPSILON = 1e-5;
 
+/** Voice band (human speech fundamentals) used for silence judgement */
+const VOICE_BAND_LOW_HZ = 300;
+const VOICE_BAND_HIGH_HZ = 3000;
+
+class Biquad {
+  private z1 = 0;
+  private z2 = 0;
+  constructor(
+    private b0: number,
+    private b1: number,
+    private b2: number,
+    private a1: number,
+    private a2: number
+  ) {}
+  process(x: number): number {
+    const y = this.b0 * x + this.z1;
+    this.z1 = this.b1 * x - this.a1 * y + this.z2;
+    this.z2 = this.b2 * x - this.a2 * y;
+    return y;
+  }
+}
+
+function makeBiquad(type: 'hp' | 'lp', fs: number, f0: number): Biquad {
+  const q = Math.SQRT1_2;
+  const w0 = (2 * Math.PI * f0) / fs;
+  const cos = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const a0 = 1 + alpha;
+  const a1 = (-2 * cos) / a0;
+  const a2 = (1 - alpha) / a0;
+  if (type === 'lp') {
+    const b = (1 - cos) / 2 / a0;
+    return new Biquad(b, (1 - cos) / a0, b, a1, a2);
+  }
+  const b = (1 + cos) / 2 / a0;
+  return new Biquad(b, -(1 + cos) / a0, b, a1, a2);
+}
+
+/**
+ * 4th-order Butterworth-like band-pass (2x high-pass @300Hz + 2x low-pass @3kHz).
+ * Attenuates desk rumble (<300Hz) and keyboard/mouse-click attack (>3kHz).
+ * Time-domain & streaming: can be fed sample by sample (offline decode or live playback scan).
+ */
+class VoiceBandFilter {
+  private stages: Biquad[];
+  constructor(sampleRate: number) {
+    const hi = Math.min(VOICE_BAND_HIGH_HZ, sampleRate * 0.45);
+    const lo = Math.min(VOICE_BAND_LOW_HZ, hi * 0.5);
+    this.stages = [
+      makeBiquad('hp', sampleRate, lo),
+      makeBiquad('hp', sampleRate, lo),
+      makeBiquad('lp', sampleRate, hi),
+      makeBiquad('lp', sampleRate, hi),
+    ];
+  }
+  process(x: number): number {
+    let v = x;
+    for (let i = 0; i < this.stages.length; i++) v = this.stages[i].process(v);
+    return v;
+  }
+}
+
 type RawLevels = {
   rawRms: number[];
+  /** Voice-band (300–3000Hz) RMS windows, same length as rawRms */
+  voiceRms: number[];
   maxSamplePeak: number;
   duration: number;
 };
@@ -127,7 +192,7 @@ async function decodeAudioBufferNative(file: File | Blob): Promise<AudioBuffer> 
 function rmsWindowsFromBuffer(
   audioBuffer: AudioBuffer,
   peaksPerSecond: number
-): { rawRms: number[]; maxSamplePeak: number } {
+): { rawRms: number[]; voiceRms: number[]; maxSamplePeak: number } {
   const duration = audioBuffer.duration;
   const numChannels = audioBuffer.numberOfChannels;
   const totalSamples = audioBuffer.length;
@@ -140,7 +205,9 @@ function rmsWindowsFromBuffer(
   }
 
   const rawRms: number[] = new Array(totalWindows);
+  const voiceRms: number[] = new Array(totalWindows);
   let maxSamplePeak = 0;
+  const filters = channels.map(() => new VoiceBandFilter(audioBuffer.sampleRate));
 
   for (let w = 0; w < totalWindows; w++) {
     const startIdx = w * samplesPerWindow;
@@ -150,20 +217,27 @@ function rmsWindowsFromBuffer(
         : Math.min(totalSamples, startIdx + samplesPerWindow);
     const count = Math.max(1, endIdx - startIdx);
     let sumSquares = 0;
+    let sumSquaresVoice = 0;
 
     for (let j = startIdx; j < endIdx; j++) {
       let maxCh = 0;
+      let maxVoice = 0;
       for (let c = 0; c < numChannels; c++) {
-        const abs = Math.abs(channels[c][j]);
+        const x = channels[c][j];
+        const abs = Math.abs(x);
         if (abs > maxCh) maxCh = abs;
+        const fv = Math.abs(filters[c].process(x));
+        if (fv > maxVoice) maxVoice = fv;
       }
       if (maxCh > maxSamplePeak) maxSamplePeak = maxCh;
       sumSquares += maxCh * maxCh;
+      sumSquaresVoice += maxVoice * maxVoice;
     }
     rawRms[w] = Number(Math.sqrt(sumSquares / count).toFixed(6));
+    voiceRms[w] = Number(Math.sqrt(sumSquaresVoice / count).toFixed(6));
   }
 
-  return { rawRms, maxSamplePeak };
+  return { rawRms, voiceRms, maxSamplePeak };
 }
 
 /** Stage 1: decodeAudioData with the default AudioContext, then downsample to RMS windows */
@@ -173,11 +247,14 @@ async function levelsViaDecode(
 ): Promise<RawLevels> {
   const buffer = await decodeAudioBufferNative(file);
   const duration = buffer.duration;
-  const { rawRms, maxSamplePeak } = rmsWindowsFromBuffer(buffer, peaksPerSecond);
+  const { rawRms, voiceRms, maxSamplePeak } = rmsWindowsFromBuffer(
+    buffer,
+    peaksPerSecond
+  );
   if (maxSamplePeak < ZERO_PEAK_EPSILON) {
     throw new Error('デコード結果の信号がすべて 0 でした');
   }
-  return { rawRms, maxSamplePeak, duration };
+  return { rawRms, voiceRms, maxSamplePeak, duration };
 }
 
 type MediaScanMode = 'element' | 'capture';
@@ -269,8 +346,12 @@ async function levelsViaMediaPlayback(
 
     const totalWindows = Math.max(1, Math.ceil(duration * peaksPerSecond));
     const rawRms = new Array<number>(totalWindows).fill(0);
+    const voiceRms = new Array<number>(totalWindows).fill(0);
     let maxSamplePeak = 0;
     let lastTime = 0;
+    const scanFilters: VoiceBandFilter[] = [];
+    let mAll = new Float32Array(0);
+    let mVoice = new Float32Array(0);
 
     processor = ctx.createScriptProcessor(1024, 2, 1);
     const silentGain = ctx.createGain();
@@ -285,6 +366,26 @@ async function levelsViaMediaPlayback(
       const chans: Float32Array[] = [];
       for (let c = 0; c < nch; c++) chans.push(input.getChannelData(c));
 
+      // Per-sample peak across channels: full band + voice band (filters keep state across blocks)
+      while (scanFilters.length < nch) scanFilters.push(new VoiceBandFilter(ctx.sampleRate));
+      if (mAll.length < n) {
+        mAll = new Float32Array(n);
+        mVoice = new Float32Array(n);
+      }
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        let mv = 0;
+        for (let c = 0; c < nch; c++) {
+          const x = chans[c][i];
+          const a = Math.abs(x);
+          if (a > m) m = a;
+          const fv = Math.abs(scanFilters[c].process(x));
+          if (fv > mv) mv = fv;
+        }
+        mAll[i] = m;
+        mVoice[i] = mv;
+      }
+
       const t1 = el.currentTime;
       const t0 = lastTime;
       lastTime = t1;
@@ -297,18 +398,18 @@ async function levelsViaMediaPlayback(
         const start = Math.floor((s * n) / segs);
         const end = Math.max(start + 1, Math.floor(((s + 1) * n) / segs));
         let sumSq = 0;
+        let sumSqV = 0;
         for (let i = start; i < end && i < n; i++) {
-          let m = 0;
-          for (let c = 0; c < nch; c++) {
-            const a = Math.abs(chans[c][i]);
-            if (a > m) m = a;
-          }
+          const m = mAll[i];
           if (m > maxSamplePeak) maxSamplePeak = m;
           sumSq += m * m;
+          sumSqV += mVoice[i] * mVoice[i];
         }
         const rms = Math.sqrt(sumSq / Math.max(1, end - start));
+        const rmsV = Math.sqrt(sumSqV / Math.max(1, end - start));
         const bin = forward ? b0 + s : b1;
         if (rms > rawRms[bin]) rawRms[bin] = rms;
+        if (rmsV > voiceRms[bin]) voiceRms[bin] = rmsV;
       }
       onProgress?.(Math.min(1, t1 / duration));
     };
@@ -364,7 +465,7 @@ async function levelsViaMediaPlayback(
       el.onerror = () => reject(new Error('再生スキャン中にエラーが発生しました'));
     });
 
-    return { rawRms, maxSamplePeak, duration };
+    return { rawRms, voiceRms, maxSamplePeak, duration };
   } finally {
     cleanup();
   }
@@ -447,6 +548,8 @@ export async function extractWaveformPeaks(
 ): Promise<{
   peaks: number[];
   rawRms: number[];
+  /** Voice-band (300–3000Hz) raw RMS windows */
+  voiceRms: number[];
   duration: number;
   sampleRate: number;
   audioStats: AudioLevelStats;
@@ -501,6 +604,7 @@ export async function extractWaveformPeaks(
       return {
         peaks,
         rawRms: levels.rawRms,
+        voiceRms: levels.voiceRms,
         duration: levels.duration,
         sampleRate: peaksPerSecond,
         audioStats,
@@ -519,6 +623,24 @@ export async function extractWaveformPeaks(
 }
 
 /**
+ * Normalize a raw RMS envelope so the 98th percentile window sits at 0 dB
+ * (same rule as the full-band waveformPeaks). Cached per array instance.
+ */
+const normalizedEnvelopeCache = new WeakMap<number[], number[]>();
+function normalizeEnvelope(raw: number[]): number[] {
+  const cached = normalizedEnvelopeCache.get(raw);
+  if (cached) return cached;
+  let max = 0;
+  for (const v of raw) if (v > max) max = v;
+  const sorted = Float32Array.from(raw).sort();
+  const p98 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))] || max;
+  const ref = Math.max(p98, max * 0.5, 1e-5);
+  const out = raw.map((v) => Math.min(1, v / ref));
+  normalizedEnvelopeCache.set(raw, out);
+  return out;
+}
+
+/**
  * Detect silent intervals across the active timeline VideoClips using RMS dB calculation.
  * - Uses Peak-Normalized RMS dB by default (`config.autoNormalize !== false`) so quiet recordings
  *   are never falsely detected as 100% silence.
@@ -533,6 +655,7 @@ export function detectSilenceOnTimeline(
   const minSilenceSec = Math.max(0.08, config.minSilenceDurationMs / 1000);
   const paddingSec = Math.max(0, config.paddingMs / 1000);
   const useNormalized = config.autoNormalize !== false;
+  const minSpeechSec = Math.max(0, (config.minSpeechDurationMs ?? 150) / 1000);
 
   const detected: CutInterval[] = [];
   let counter = 0;
@@ -556,12 +679,22 @@ export function detectSilenceOnTimeline(
       );
     }
 
-    const sourceArray =
-      !useNormalized &&
-      asset.rawWaveformRms &&
-      asset.rawWaveformRms.length > 0
-        ? asset.rawWaveformRms
-        : asset.waveformPeaks;
+    // Prefer the voice-band (300–3000Hz) envelope: keyboard clicks / desk thumps are attenuated
+    const voiceRaw =
+      config.useVoiceBandFilter !== false &&
+      asset.voiceBandRms &&
+      asset.voiceBandRms.length > 0
+        ? asset.voiceBandRms
+        : null;
+    const sourceArray = voiceRaw
+      ? useNormalized
+        ? normalizeEnvelope(voiceRaw)
+        : voiceRaw
+      : !useNormalized &&
+        asset.rawWaveformRms &&
+        asset.rawWaveformRms.length > 0
+      ? asset.rawWaveformRms
+      : asset.waveformPeaks;
 
     if (!sourceArray || sourceArray.length === 0) {
       throw new Error(
@@ -595,8 +728,6 @@ export function detectSilenceOnTimeline(
     const dynamicGain =
       useNormalized && maxValInClip < 0.5 ? 1.0 / maxValInClip : 1.0;
 
-    let silentStartPeak: number | null = null;
-
     const recordSilentSegment = (startIdx: number, endIdx: number) => {
       const srcSilenceStart = Math.max(clip.sourceStart, startIdx / rate);
       const srcSilenceEnd = Math.min(clip.sourceEnd, endIdx / rate);
@@ -618,12 +749,17 @@ export function detectSilenceOnTimeline(
           category: 'silence',
           reason: `無音区間 (${(paddedEnd - paddedStart).toFixed(2)}s / < ${
             config.thresholdDb
-          }dB${useNormalized ? ' 正規化基準' : ' Raw dBFS'})`,
+          }dB${useNormalized ? ' 正規化基準' : ' Raw dBFS'}${
+            voiceRaw ? ' / 声帯域300-3000Hz' : ''
+          }${minSpeechSec > 0 ? ` / ${Math.round(minSpeechSec * 1000)}ms未満の短音は無視` : ''})`,
           selected: true,
         });
       }
     };
 
+    // Step 1: provisional voiced / silent decision per window by threshold
+    const winCount = Math.max(0, endPeakIdx - startPeakIdx + 1);
+    const silent: boolean[] = new Array(winCount);
     for (let i = startPeakIdx; i <= endPeakIdx; i++) {
       // 3-point local RMS smoothing (prevents 20ms zero-crossings in speech from splitting)
       const prev = sourceArray[Math.max(startPeakIdx, i - 1)] ?? 0;
@@ -634,18 +770,37 @@ export function detectSilenceOnTimeline(
       // Convert linear RMS to dB: 20 * log10(rms)
       const currentDb =
         smoothedRms <= 1e-6 ? -100 : 20 * Math.log10(smoothedRms);
-      const isSilent = currentDb < config.thresholdDb;
+      silent[i - startPeakIdx] = currentDb < config.thresholdDb;
+    }
 
-      if (isSilent && silentStartPeak === null) {
-        silentStartPeak = i;
-      } else if (!isSilent && silentStartPeak !== null) {
-        recordSilentSegment(silentStartPeak, i);
-        silentStartPeak = null;
+    // Step 2: de-glitch — voiced runs shorter than minSpeechDurationMs (keyboard clicks, coughs,
+    // mic pops) are not speech: absorb them into silence.
+    const minSpeechWindows = Math.round(minSpeechSec * rate);
+    if (minSpeechWindows > 1) {
+      let runStart = -1;
+      for (let k = 0; k <= winCount; k++) {
+        const voiced = k < winCount && !silent[k];
+        if (voiced && runStart === -1) {
+          runStart = k;
+        } else if (!voiced && runStart !== -1) {
+          if (k - runStart < minSpeechWindows) {
+            for (let q = runStart; q < k; q++) silent[q] = true;
+          }
+          runStart = -1;
+        }
       }
     }
 
-    if (silentStartPeak !== null) {
-      recordSilentSegment(silentStartPeak, endPeakIdx);
+    // Step 3: silent runs -> candidates (minSilenceDuration is enforced in recordSilentSegment)
+    let silentStartPeak: number | null = null;
+    for (let k = 0; k <= winCount; k++) {
+      const isSilent = k < winCount && silent[k];
+      if (isSilent && silentStartPeak === null) {
+        silentStartPeak = k;
+      } else if (!isSilent && silentStartPeak !== null) {
+        recordSilentSegment(startPeakIdx + silentStartPeak, startPeakIdx + k);
+        silentStartPeak = null;
+      }
     }
   }
 
@@ -671,6 +826,119 @@ export function detectSilenceOnTimeline(
   }
 
   return detected;
+}
+
+/**
+ * Transcript-linked non-speech noise detection (coughs, keyboard, rustling):
+ * finds regions where the waveform is above the threshold while NO subtitle (speech text)
+ * covers the time. Returns `type: 'noise'` cut candidates.
+ * Uses the full-band normalized envelope (coughs / typing are broadband and must be seen).
+ */
+export function detectNoiseOutsideSubtitles(
+  videoClips: VideoClip[],
+  mediaAssets: MediaAsset[],
+  subtitles: SubtitleItem[],
+  config: SilenceConfig,
+  existingSilence: CutInterval[] = []
+): CutInterval[] {
+  if (subtitles.length === 0) return [];
+
+  const SUB_MARGIN = 0.12; // speech margin around each subtitle (s)
+  const MIN_NOISE_SEC = 0.12;
+  const MERGE_GAP_SEC = 0.12;
+  const EDGE_EXTEND = 0.06;
+
+  // Merged speech coverage on the timeline
+  const speech: Array<{ s: number; e: number }> = [];
+  for (const sub of [...subtitles].sort((a, b) => a.startTime - b.startTime)) {
+    const s0 = sub.startTime - SUB_MARGIN;
+    const e0 = sub.endTime + SUB_MARGIN;
+    const last = speech[speech.length - 1];
+    if (last && s0 <= last.e) last.e = Math.max(last.e, e0);
+    else speech.push({ s: s0, e: e0 });
+  }
+  const isCovered = (t: number) => speech.some((r) => t >= r.s && t < r.e);
+  const nextSpeechStart = (t: number) =>
+    speech.find((r) => r.s > t)?.s ?? Infinity;
+  const prevSpeechEnd = (t: number) => {
+    let v = -Infinity;
+    for (const r of speech) if (r.e <= t) v = r.e;
+    return v;
+  };
+
+  const useNormalized = config.autoNormalize !== false;
+  const out: CutInterval[] = [];
+  let counter = 0;
+
+  for (const clip of videoClips) {
+    const asset = mediaAssets.find((m) => m.id === clip.mediaId);
+    if (!asset || asset.audioAnalyzing || asset.audioDecodeError) continue;
+    const arr =
+      !useNormalized && asset.rawWaveformRms && asset.rawWaveformRms.length > 0
+        ? asset.rawWaveformRms
+        : asset.waveformPeaks;
+    if (!arr || arr.length === 0) continue;
+    const rate = asset.waveformSampleRate || 50;
+    const i0 = Math.max(0, Math.floor(clip.sourceStart * rate));
+    const i1 = Math.min(arr.length - 1, Math.ceil(clip.sourceEnd * rate) - 1);
+    const toTimeline = (srcSec: number) =>
+      clip.startTime + (srcSec - clip.sourceStart) / clip.speed;
+
+    let runStart = -1;
+    const flush = (endIdx: number) => {
+      // [runStart, endIdx) windows
+      let start = toTimeline(Math.max(clip.sourceStart, runStart / rate));
+      let end = toTimeline(Math.min(clip.sourceEnd, endIdx / rate));
+      if (end - start < MIN_NOISE_SEC) return;
+      // Extend a little to catch the decay tail, but never into speech
+      start = Math.max(start - EDGE_EXTEND, prevSpeechEnd(start), clip.startTime);
+      end = Math.min(
+        end + EDGE_EXTEND,
+        nextSpeechStart(end),
+        clip.startTime + clip.duration
+      );
+      if (end - start < MIN_NOISE_SEC) return;
+      // Skip when already fully inside a silence candidate
+      if (existingSilence.some((c) => start >= c.start - 0.02 && end <= c.end + 0.02)) {
+        return;
+      }
+      out.push({
+        id: `noise-${counter++}-${Math.round(start * 1000)}`,
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        type: 'noise',
+        category: 'noise',
+        reason: `[ノイズ/咳・打鍵音] 字幕のない時間帯に ${config.thresholdDb}dB 超の音 (${(
+          end - start
+        ).toFixed(2)}s)`,
+        selected: true,
+      });
+    };
+
+    let quietGap = 0;
+    for (let i = i0; i <= i1 + 1; i++) {
+      let loud = false;
+      if (i <= i1) {
+        const v = arr[i] ?? 0;
+        const db = v <= 1e-6 ? -100 : 20 * Math.log10(v);
+        const t = toTimeline(i / rate + 0.5 / rate);
+        loud = db >= config.thresholdDb && !isCovered(t);
+      }
+      if (loud) {
+        if (runStart === -1) runStart = i;
+        quietGap = 0;
+      } else if (runStart !== -1) {
+        quietGap++;
+        if (quietGap >= Math.max(1, Math.round(MERGE_GAP_SEC * rate)) || i > i1) {
+          flush(i - quietGap + 1);
+          runStart = -1;
+          quietGap = 0;
+        }
+      }
+    }
+  }
+
+  return out.sort((a, b) => a.start - b.start);
 }
 
 /**

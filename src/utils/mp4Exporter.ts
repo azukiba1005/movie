@@ -1,6 +1,7 @@
 import { Muxer, StreamTarget } from 'mp4-muxer';
 import {
   AspectRatioType,
+  AudioEffectsSettings,
   BgmClip,
   MediaAsset,
   SubtitleItem,
@@ -10,6 +11,11 @@ import {
   getCanvasDimensions,
   renderCompositeFrame,
 } from './canvasRenderer';
+import {
+  createEffectChain,
+  getMasterAudioStats,
+  resolveMakeupDb,
+} from './audioEffects';
 
 export interface Mp4ExportOptions {
   projectName: string;
@@ -23,6 +29,8 @@ export interface Mp4ExportOptions {
   /** Multicam: Cam 2 media id + offset (cam2 time = cam1 source time + cam2Offset) */
   cam2MediaId?: string | null;
   cam2Offset?: number;
+  /** Master audio compressor / loudness settings (same graph as the preview) */
+  audioEffects?: AudioEffectsSettings;
   onProgress?: (percent: number, stageText: string) => void;
   signal?: AbortSignal;
 }
@@ -141,6 +149,18 @@ function createVideoFeeder(options: {
   };
 }
 
+/** Effect settings for the offline render (undefined when the compressor is OFF) */
+function resolveExportEffects(options: Mp4ExportOptions) {
+  const fx = options.audioEffects;
+  if (!fx || !fx.compressorEnabled) return undefined;
+  const stats = getMasterAudioStats(
+    options.videoClips,
+    options.mediaAssets,
+    options.cam2MediaId
+  );
+  return { settings: fx, makeupDb: resolveMakeupDb(fx, stats) };
+}
+
 /**
  * Render mixed timeline audio (Track 2 VideoClips with speed/volume + Track 3 BGM with fadeIn/fadeOut)
  * for a given time window [windowStart, windowEnd] using OfflineAudioContext.
@@ -152,19 +172,37 @@ async function renderAudioWindow(params: {
   videoClips: VideoClip[];
   bgmClips: BgmClip[];
   decodedAudioMap: Map<string, AudioBuffer>;
+  /** When set, video-clip (master) audio is routed through the shared effect chain */
+  effects?: { settings: AudioEffectsSettings; makeupDb: number };
 }): Promise<AudioBuffer> {
   const {
-    windowStart,
+    windowStart: requestedStart,
     windowEnd,
     sampleRate,
     videoClips,
     bgmClips,
     decodedAudioMap,
+    effects,
   } = params;
+
+  // Pre-roll so the compressor envelope is warmed up at window boundaries (trimmed afterwards)
+  const preroll = effects ? Math.min(1.0, requestedStart) : 0;
+  const windowStart = requestedStart - preroll;
 
   const duration = Math.max(0.05, windowEnd - windowStart);
   const frameCount = Math.ceil(duration * sampleRate);
   const offlineCtx = new OfflineAudioContext(2, frameCount, sampleRate);
+
+  const masterBus: AudioNode = (() => {
+    if (!effects) return offlineCtx.destination;
+    const chain = createEffectChain(
+      offlineCtx,
+      effects.settings,
+      effects.makeupDb
+    );
+    chain.output.connect(offlineCtx.destination);
+    return chain.input;
+  })();
 
   // 1. Schedule Track 2 Video Clips audio
   for (const clip of videoClips) {
@@ -192,7 +230,7 @@ async function renderAudioWindow(params: {
     gainNode.gain.value = clip.volume;
 
     srcNode.connect(gainNode);
-    gainNode.connect(offlineCtx.destination);
+    gainNode.connect(masterBus);
 
     srcNode.start(overlapStart - windowStart, srcOffset, srcDur);
   }
@@ -258,7 +296,21 @@ async function renderAudioWindow(params: {
     srcNode.start(startInWindow, srcOffset, overlapDur);
   }
 
-  return offlineCtx.startRendering();
+  const rendered = await offlineCtx.startRendering();
+  if (preroll <= 0) return rendered;
+
+  // Trim the pre-roll
+  const skip = Math.round(preroll * sampleRate);
+  const outLength = Math.max(1, rendered.length - skip);
+  const trimmed = new AudioBuffer({
+    length: outLength,
+    numberOfChannels: rendered.numberOfChannels,
+    sampleRate,
+  });
+  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
+    trimmed.copyToChannel(rendered.getChannelData(ch).subarray(skip, skip + outLength), ch);
+  }
+  return trimmed;
 }
 
 /**
@@ -344,6 +396,7 @@ async function exportViaMediaRecorderFallback(
     videoClips,
     bgmClips,
     decodedAudioMap,
+    effects: resolveExportEffects(options),
   });
 
   const audioSource = audioCtx.createBufferSource();
@@ -479,6 +532,8 @@ export async function exportTimelineToMp4(
     subtitles.reduce((acc, s) => Math.max(acc, s.endTime), 0),
     1
   );
+
+  const exportEffects = resolveExportEffects(options);
 
   onProgress?.(2, '音声トラックをデコードしています...');
 
@@ -618,6 +673,7 @@ export async function exportTimelineToMp4(
         videoClips,
         bgmClips,
         decodedAudioMap,
+        effects: exportEffects,
       });
 
       const left = renderedAudio.getChannelData(0);

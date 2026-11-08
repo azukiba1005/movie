@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useEditorStore } from '../store/useEditorStore';
 import {
+  detectNoiseOutsideSubtitles,
   detectSilenceOnTimeline,
   encodeMonoAudioBufferToWav,
   estimateCam2Offset,
@@ -270,6 +271,7 @@ export const LeftPanel: React.FC = () => {
       updateMediaAsset(assetId, {
         waveformPeaks: waveform.peaks,
         rawWaveformRms: waveform.rawRms,
+        voiceBandRms: waveform.voiceRms,
         waveformSampleRate: waveform.sampleRate,
         audioStats: waveform.audioStats,
         audioAnalyzing: false,
@@ -410,6 +412,7 @@ export const LeftPanel: React.FC = () => {
         mimeType: 'audio/wav',
         waveformPeaks: waveform.peaks,
         rawWaveformRms: waveform.rawRms,
+        voiceBandRms: waveform.voiceRms,
         waveformSampleRate: waveform.sampleRate,
         audioStats: waveform.audioStats,
       };
@@ -545,10 +548,24 @@ export const LeftPanel: React.FC = () => {
         }
       }
       const state = useEditorStore.getState();
-      const intervals = detectSilenceOnTimeline(
+      const silenceIntervals = detectSilenceOnTimeline(
         state.videoClips,
         state.mediaAssets,
         state.silenceConfig
+      );
+      const noiseIntervals =
+        state.silenceConfig.detectNoiseByTranscript !== false &&
+        state.subtitles.length > 0
+          ? detectNoiseOutsideSubtitles(
+              state.videoClips,
+              state.mediaAssets,
+              state.subtitles,
+              state.silenceConfig,
+              silenceIntervals
+            )
+          : [];
+      const intervals = [...silenceIntervals, ...noiseIntervals].sort(
+        (a, b) => a.start - b.start
       );
       setCutIntervals(intervals);
       if (intervals.length === 0) {
@@ -561,9 +578,9 @@ export const LeftPanel: React.FC = () => {
           0
         );
         setStatusNotification(
-          `${intervals.length}箇所の無音区間（計 ${totalSaved.toFixed(
-            1
-          )}秒）を検出しました`
+          `${intervals.length}箇所（無音 ${silenceIntervals.length} / ノイズ ${
+            noiseIntervals.length
+          }、計 ${totalSaved.toFixed(1)}秒）を検出しました`
         );
       }
     } catch (err) {
@@ -739,11 +756,18 @@ export const LeftPanel: React.FC = () => {
     if (videoClips.length === 0 || !primaryVideoAsset) return null;
     if (primaryVideoAsset.audioAnalyzing) return null;
     try {
-      const iv = detectSilenceOnTimeline(
-        videoClips,
-        mediaAssets,
-        silenceConfig
-      );
+      const sil = detectSilenceOnTimeline(videoClips, mediaAssets, silenceConfig);
+      const noi =
+        silenceConfig.detectNoiseByTranscript !== false && subtitles.length > 0
+          ? detectNoiseOutsideSubtitles(
+              videoClips,
+              mediaAssets,
+              subtitles,
+              silenceConfig,
+              sil
+            )
+          : [];
+      const iv = [...sil, ...noi];
       return {
         count: iv.length,
         seconds: iv.reduce((acc, i) => acc + (i.end - i.start), 0),
@@ -756,7 +780,7 @@ export const LeftPanel: React.FC = () => {
         error: err instanceof Error ? err.message : String(err),
       };
     }
-  }, [videoClips, mediaAssets, silenceConfig, primaryVideoAsset]);
+  }, [videoClips, mediaAssets, silenceConfig, primaryVideoAsset, subtitles]);
 
   // Percentage of waveform windows that are "voiced" (>= threshold) for the current slider
   const voicedPercent = useMemo(() => {
@@ -1389,6 +1413,88 @@ export const LeftPanel: React.FC = () => {
                 />
               </div>
 
+              {/* Min speech duration (de-glitch) Slider */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-zinc-400">
+                    短音の無視（打鍵音・咳払い除去）
+                  </span>
+                  <span className="font-mono text-cyan-300">
+                    {silenceConfig.minSpeechDurationMs ?? 150} ms
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={500}
+                  step={10}
+                  value={silenceConfig.minSpeechDurationMs ?? 150}
+                  onChange={(e) =>
+                    setSilenceConfig({
+                      minSpeechDurationMs: Number(e.target.value),
+                    })
+                  }
+                  className="w-full accent-cyan-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer"
+                />
+                <div className="text-[10px] text-zinc-500">
+                  この時間より短い「有音」は発話ではなくノイズとみなし、無音に含めてカットします。
+                </div>
+              </div>
+
+              {/* Voice band filter toggle */}
+              <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={silenceConfig.useVoiceBandFilter !== false}
+                  onChange={(e) =>
+                    setSilenceConfig({ useVoiceBandFilter: e.target.checked })
+                  }
+                  className="mt-0.5 accent-cyan-500 rounded cursor-pointer"
+                />
+                <div className="text-[11px] leading-snug">
+                  <div className="font-semibold text-zinc-200">
+                    音声帯域フィルタ（300〜3,000Hz）で判定
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">
+                    机の振動や打鍵・クリック音の高音を減衰させてから音量を測ります。
+                  </div>
+                  {silenceConfig.useVoiceBandFilter !== false &&
+                    primaryVideoAsset &&
+                    !primaryVideoAsset.audioAnalyzing &&
+                    !(primaryVideoAsset.voiceBandRms?.length) && (
+                      <div className="text-[10px] text-amber-400 mt-0.5">
+                        この動画は帯域データが未計測です。「波形再解析」で有効になります（現在は全帯域で判定）。
+                      </div>
+                    )}
+                </div>
+              </label>
+
+              {/* Transcript-linked noise detection toggle */}
+              <label className="flex items-start gap-2 p-2 rounded-lg bg-zinc-950/60 border border-zinc-800/80 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={silenceConfig.detectNoiseByTranscript !== false}
+                  onChange={(e) =>
+                    setSilenceConfig({
+                      detectNoiseByTranscript: e.target.checked,
+                    })
+                  }
+                  className="mt-0.5 accent-cyan-500 rounded cursor-pointer"
+                />
+                <div className="text-[11px] leading-snug">
+                  <div className="font-semibold text-zinc-200">
+                    字幕連動ノイズ検出（咳き込み・打鍵音）
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">
+                    字幕（発話テキスト）が無い時間帯でしきい値を超えて鳴っている音を
+                    [ノイズ/咳・打鍵音] としてカット候補に追加します。
+                    {subtitles.length === 0
+                      ? '（字幕がまだ無いため現在は無効：先に自動文字起こしを実行してください）'
+                      : `（字幕 ${subtitles.length} 件を使用）`}
+                  </div>
+                </div>
+              </label>
+
               {/* Padding ms Slider */}
               <div className="space-y-1">
                 <div className="flex justify-between text-[11px]">
@@ -1512,7 +1618,9 @@ export const LeftPanel: React.FC = () => {
                             {ci.start.toFixed(2)}s - {ci.end.toFixed(2)}s
                           </span>
                           <span className="px-1.5 py-0.2 rounded bg-zinc-800 text-[10px] text-zinc-300">
-                            {ci.category === 'retake'
+                            {ci.category === 'noise'
+                              ? '[ノイズ/咳・打鍵音]'
+                              : ci.category === 'retake'
                               ? '言い直し'
                               : ci.category === 'filler'
                               ? 'フィラー'
