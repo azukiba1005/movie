@@ -659,7 +659,9 @@ export function detectSilenceOnTimeline(
     totalTimelineDuration > 5 &&
     totalSilentDuration >= totalTimelineDuration * 0.95
   ) {
-    const firstAsset = mediaAssets.find((m) => m.type === 'video');
+    const firstAsset = mediaAssets.find(
+      (m) => m.type === 'video' && videoClips.some((c) => c.mediaId === m.id)
+    );
     const suggested = firstAsset?.audioStats?.suggestedThresholdDb ?? -32;
     throw new Error(
       `現在のしきい値 (${config.thresholdDb} dB) では動画全体（${totalSilentDuration.toFixed(
@@ -821,4 +823,146 @@ export async function renderTimelineAudioChunksForWhisper(
   }
 
   return chunks;
+}
+
+
+/**
+ * Convert an RMS envelope slice into a zero-mean, unit-variance "feature" signal that is robust
+ * against gain / mic differences between two cameras (sqrt compression + 1s moving-average removal).
+ */
+function envelopeToSyncFeature(
+  env: ArrayLike<number>,
+  rate: number,
+  maxSeconds: number
+): Float32Array {
+  const n = Math.min(env.length, Math.floor(maxSeconds * rate));
+  const comp = new Float32Array(n);
+  for (let i = 0; i < n; i++) comp[i] = Math.sqrt(Math.max(0, env[i] ?? 0));
+
+  const half = Math.max(1, Math.round(rate * 0.5));
+  const prefix = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i] + comp[i];
+
+  const out = new Float32Array(n);
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(0, i - half);
+    const b = Math.min(n, i + half + 1);
+    const mean = (prefix[b] - prefix[a]) / (b - a);
+    out[i] = comp[i] - mean;
+    sumSq += out[i] * out[i];
+  }
+  const std = Math.sqrt(sumSq / Math.max(1, n)) || 1;
+  for (let i = 0; i < n; i++) out[i] /= std;
+  return out;
+}
+
+export interface Cam2SyncResult {
+  /** cam2 media time = cam1 media time + offsetSec */
+  offsetSec: number;
+  /** Normalized cross-correlation at the peak (0..1) */
+  confidence: number;
+}
+
+/**
+ * Estimate the time offset between Cam 1 and Cam 2 by cross-correlating the audio loudness
+ * envelopes (RMS windows) of the first `analyzeSeconds` of each recording.
+ * Returned `offsetSec` is sub-window precise (parabolic peak interpolation).
+ * Positive offset: the same sound happens LATER in the Cam 2 file than in the Cam 1 file.
+ */
+export function estimateCam2Offset(
+  cam1: MediaAsset,
+  cam2: MediaAsset,
+  analyzeSeconds = 120,
+  maxLagSeconds = 90
+): Cam2SyncResult {
+  const pickEnv = (a: MediaAsset) =>
+    a.rawWaveformRms && a.rawWaveformRms.length > 0
+      ? a.rawWaveformRms
+      : a.waveformPeaks;
+
+  for (const a of [cam1, cam2]) {
+    if (a.audioAnalyzing) {
+      throw new Error(`「${a.name}」の音声を解析中です。完了するまでお待ちください。`);
+    }
+    if (!pickEnv(a) || pickEnv(a).length === 0) {
+      throw new Error(
+        `「${a.name}」の音声波形がありません。音声が無い、または解析に失敗しています。`
+      );
+    }
+  }
+
+  const rate1 = cam1.waveformSampleRate || 50;
+  const rate2 = cam2.waveformSampleRate || 50;
+  if (Math.abs(rate1 - rate2) > 1e-6) {
+    throw new Error('2つの動画の波形サンプルレートが異なります。波形を再解析してください。');
+  }
+  const rate = rate1;
+
+  const fa = envelopeToSyncFeature(pickEnv(cam1), rate, analyzeSeconds);
+  const fb = envelopeToSyncFeature(pickEnv(cam2), rate, analyzeSeconds);
+  const na = fa.length;
+  const nb = fb.length;
+  const minOverlap = Math.floor(Math.min(20, analyzeSeconds / 4) * rate);
+  if (na < minOverlap || nb < minOverlap) {
+    throw new Error('同期に使える音声が短すぎます（最低でも約20秒必要です）。');
+  }
+
+  const maxLag = Math.floor(maxLagSeconds * rate);
+  const lagMin = -Math.min(maxLag, na - minOverlap);
+  const lagMax = Math.min(maxLag, nb - minOverlap);
+  const scores = new Float32Array(lagMax - lagMin + 1);
+
+  let bestIdx = 0;
+  let bestScore = -Infinity;
+  for (let k = lagMin; k <= lagMax; k++) {
+    // cam2[i + k] ~ cam1[i]
+    const i0 = Math.max(0, -k);
+    const i1 = Math.min(na, nb - k);
+    const overlap = i1 - i0;
+    if (overlap < minOverlap) {
+      scores[k - lagMin] = -1;
+      continue;
+    }
+    let dot = 0;
+    let sa = 0;
+    let sb = 0;
+    for (let i = i0; i < i1; i++) {
+      const x = fa[i];
+      const y = fb[i + k];
+      dot += x * y;
+      sa += x * x;
+      sb += y * y;
+    }
+    const score = dot / (Math.sqrt(sa * sb) || 1);
+    scores[k - lagMin] = score;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = k - lagMin;
+    }
+  }
+
+  if (!Number.isFinite(bestScore) || bestScore < 0.12) {
+    throw new Error(
+      '音声の一致を検出できませんでした（相関が低すぎます）。両カメラに同じ音が録音されているか確認し、手動で調整してください。'
+    );
+  }
+
+  // Parabolic interpolation around the peak for sub-window precision
+  let delta = 0;
+  if (bestIdx > 0 && bestIdx < scores.length - 1) {
+    const y0 = scores[bestIdx - 1];
+    const y1 = scores[bestIdx];
+    const y2 = scores[bestIdx + 1];
+    const denom = y0 - 2 * y1 + y2;
+    if (Math.abs(denom) > 1e-9) {
+      delta = Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / denom));
+    }
+  }
+
+  const lag = lagMin + bestIdx + delta;
+  return {
+    offsetSec: Number((lag / rate).toFixed(3)) + 0,
+    confidence: Number(Math.max(0, Math.min(1, bestScore)).toFixed(3)),
+  };
 }

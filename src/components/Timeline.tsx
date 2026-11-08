@@ -137,6 +137,8 @@ export const Timeline: React.FC = () => {
   const activeTool = useEditorStore((s) => s.activeTool);
   const selectedItemType = useEditorStore((s) => s.selectedItemType);
   const selectedItemId = useEditorStore((s) => s.selectedItemId);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const setClipCameraAngle = useEditorStore((s) => s.setClipCameraAngle);
 
   const setCurrentTime = useEditorStore((s) => s.setCurrentTime);
   const setIsPlaying = useEditorStore((s) => s.setIsPlaying);
@@ -718,6 +720,8 @@ export const Timeline: React.FC = () => {
                     className={`absolute top-1.5 bottom-1.5 rounded-md border flex flex-col justify-between overflow-hidden transition-colors ${
                       isSelected
                         ? 'bg-cyan-950/80 border-cyan-400 ring-1 ring-cyan-400/50 z-10'
+                        : (clip.cameraAngle ?? 1) === 2 && cam2MediaId
+                        ? 'bg-orange-950/45 hover:bg-orange-950/65 border-orange-500/50'
                         : 'bg-cyan-950/45 hover:bg-cyan-950/65 border-cyan-600/40'
                     }`}
                   >
@@ -746,6 +750,26 @@ export const Timeline: React.FC = () => {
                     <div className="h-5 px-2 bg-cyan-950/90 border-b border-cyan-500/20 flex items-center justify-between text-[10px] text-cyan-200 pointer-events-none shrink-0">
                       <span className="font-medium truncate">{clip.name}</span>
                       <div className="flex items-center gap-1 font-mono shrink-0">
+                        {cam2MediaId && (
+                          <span
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              selectItem('video', clip.id);
+                              setClipCameraAngle(
+                                clip.id,
+                                (clip.cameraAngle ?? 1) === 1 ? 2 : 1
+                              );
+                            }}
+                            title="クリックでアングル切替 (Cam 1 ⇄ Cam 2)"
+                            className={`px-1 rounded font-bold pointer-events-auto cursor-pointer ${
+                              (clip.cameraAngle ?? 1) === 2
+                                ? 'bg-orange-500 text-zinc-950'
+                                : 'bg-cyan-500 text-zinc-950'
+                            }`}
+                          >
+                            Cam {clip.cameraAngle ?? 1}
+                          </span>
+                        )}
                         {Math.abs(clip.speed - 1.0) > 0.01 && (
                           <span className="px-1 rounded bg-cyan-500/30 text-cyan-200 font-bold">
                             {clip.speed.toFixed(2)}x

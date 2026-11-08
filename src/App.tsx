@@ -54,6 +54,30 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Multicam angle: 1 = Cam 1, 2 = Cam 2
+      if ((e.key === '1' || e.key === '2') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        const angle = e.key === '1' ? 1 : 2;
+        if (!state.cam2MediaId) {
+          if (angle === 2) {
+            state.setStatusNotification('先にCam 2（サブカメラ）を登録してください');
+          }
+          return;
+        }
+        if (
+          !state.isPlaying &&
+          state.selectedItemType === 'video' &&
+          state.selectedItemId
+        ) {
+          // Stopped with a clip selected: change that clip's angle
+          state.setClipCameraAngle(state.selectedItemId, angle);
+        } else {
+          // Live switching at the playhead (splits the clip under the playhead)
+          state.liveSwitchAngle(angle);
+        }
+        return;
+      }
+
       // Split at Playhead / Razor Tool: B or S
       if (e.key.toLowerCase() === 'b' || e.key.toLowerCase() === 's') {
         if (!e.metaKey && !e.ctrlKey) {

@@ -20,6 +20,9 @@ export interface Mp4ExportOptions {
   videoClips: VideoClip[];
   subtitles: SubtitleItem[];
   bgmClips: BgmClip[];
+  /** Multicam: Cam 2 media id + offset (cam2 time = cam1 source time + cam2Offset) */
+  cam2MediaId?: string | null;
+  cam2Offset?: number;
   onProgress?: (percent: number, stageText: string) => void;
   signal?: AbortSignal;
 }
@@ -69,6 +72,73 @@ function seekVideoElement(
       finish();
     }
   });
+}
+
+/**
+ * Video frame feeder: picks Cam 1 / Cam 2 element per clip.cameraAngle and seeks it.
+ * Audio never comes from here (Cam 1 is the master audio).
+ */
+function createVideoFeeder(options: {
+  mediaAssets: MediaAsset[];
+  cam2MediaId?: string | null;
+  cam2Offset?: number;
+}) {
+  const { mediaAssets, cam2MediaId, cam2Offset = 0 } = options;
+  const makeEl = () => {
+    const el = document.createElement('video');
+    el.muted = true;
+    el.playsInline = true;
+    el.preload = 'auto';
+    return el;
+  };
+  const cam1El = makeEl();
+  const cam2El = makeEl();
+  const loaded = new Map<HTMLVideoElement, string>();
+
+  const ensureLoaded = async (el: HTMLVideoElement, url: string) => {
+    if (loaded.get(el) === url) return;
+    loaded.set(el, url);
+    el.src = url;
+    await new Promise<void>((resolve) => {
+      el.onloadeddata = () => resolve();
+      el.onerror = () => resolve();
+      el.load();
+    });
+  };
+
+  return async (
+    clip: VideoClip | null,
+    timelineTime: number
+  ): Promise<{ videoElement: HTMLVideoElement; missingVideoFile: boolean }> => {
+    if (!clip) return { videoElement: cam1El, missingVideoFile: false };
+    const srcTime =
+      clip.sourceStart + (timelineTime - clip.startTime) * clip.speed;
+
+    if (clip.cameraAngle === 2 && cam2MediaId) {
+      const asset2 = mediaAssets.find((m) => m.id === cam2MediaId);
+      const t2 = srcTime + cam2Offset;
+      if (
+        asset2 &&
+        asset2.objectUrl &&
+        !asset2.missingFile &&
+        t2 >= 0 &&
+        t2 < asset2.duration
+      ) {
+        await ensureLoaded(cam2El, asset2.objectUrl);
+        await seekVideoElement(cam2El, t2);
+        return { videoElement: cam2El, missingVideoFile: false };
+      }
+      // Cam 2 unavailable at this time -> fall back to Cam 1
+    }
+
+    const asset = mediaAssets.find((m) => m.id === clip.mediaId);
+    if (asset && asset.objectUrl && !asset.missingFile) {
+      await ensureLoaded(cam1El, asset.objectUrl);
+      await seekVideoElement(cam1El, srcTime);
+      return { videoElement: cam1El, missingVideoFile: false };
+    }
+    return { videoElement: cam1El, missingVideoFile: true };
+  };
 }
 
 /**
@@ -307,10 +377,11 @@ async function exportViaMediaRecorderFallback(
     }
   };
 
-  const videoEl = document.createElement('video');
-  videoEl.muted = true;
-  videoEl.playsInline = true;
-  let loadedUrl = '';
+  const feedVideo = createVideoFeeder({
+    mediaAssets,
+    cam2MediaId: options.cam2MediaId,
+    cam2Offset: options.cam2Offset,
+  });
 
   recorder.start(200);
   audioSource.start(0);
@@ -331,27 +402,9 @@ async function exportViaMediaRecorderFallback(
           timelineTime < c.startTime + c.duration
       ) || null;
 
-    let missingVideoFile = false;
-    if (activeClip) {
-      const asset = mediaAssets.find((m) => m.id === activeClip.mediaId);
-      if (asset && asset.objectUrl && !asset.missingFile) {
-        if (loadedUrl !== asset.objectUrl) {
-          loadedUrl = asset.objectUrl;
-          videoEl.src = asset.objectUrl;
-          await new Promise<void>((r) => {
-            videoEl.onloadeddata = () => r();
-            videoEl.onerror = () => r();
-            videoEl.load();
-          });
-        }
-        const targetSourceTime =
-          activeClip.sourceStart +
-          (timelineTime - activeClip.startTime) * activeClip.speed;
-        await seekVideoElement(videoEl, targetSourceTime);
-      } else {
-        missingVideoFile = true;
-      }
-    }
+    const fed = await feedVideo(activeClip, timelineTime);
+    const missingVideoFile = activeClip ? fed.missingVideoFile : false;
+    const videoEl = fed.videoElement;
 
     renderCompositeFrame({
       ctx,
@@ -438,7 +491,7 @@ export async function exportTimelineToMp4(
   const decodeCtx = new AudioCtx();
 
   for (const asset of mediaAssets) {
-    if (!asset.file) continue;
+    if (!asset.file || asset.id === options.cam2MediaId) continue; // Cam 2 audio is never used
     try {
       const ab = await asset.file.arrayBuffer();
       const decoded = await decodeCtx.decodeAudioData(ab.slice(0));
@@ -610,11 +663,11 @@ export async function exportTimelineToMp4(
     throw new Error('2D Canvas コンテキストの初期化に失敗しました');
   }
 
-  const videoEl = document.createElement('video');
-  videoEl.muted = true;
-  videoEl.playsInline = true;
-  videoEl.preload = 'auto';
-  let loadedObjectUrl = '';
+  const feedVideo = createVideoFeeder({
+    mediaAssets,
+    cam2MediaId: options.cam2MediaId,
+    cam2Offset: options.cam2Offset,
+  });
 
   const totalFrames = Math.max(1, Math.ceil(totalDuration * fps));
 
@@ -635,28 +688,9 @@ export async function exportTimelineToMp4(
           timelineTime < c.startTime + c.duration
       ) || null;
 
-    let missingVideoFile = false;
-
-    if (activeClip) {
-      const asset = mediaAssets.find((m) => m.id === activeClip.mediaId);
-      if (asset && asset.objectUrl && !asset.missingFile) {
-        if (loadedObjectUrl !== asset.objectUrl) {
-          loadedObjectUrl = asset.objectUrl;
-          videoEl.src = asset.objectUrl;
-          await new Promise<void>((resolve) => {
-            videoEl.onloadeddata = () => resolve();
-            videoEl.onerror = () => resolve();
-            videoEl.load();
-          });
-        }
-        const targetSourceTime =
-          activeClip.sourceStart +
-          (timelineTime - activeClip.startTime) * activeClip.speed;
-        await seekVideoElement(videoEl, targetSourceTime);
-      } else {
-        missingVideoFile = true;
-      }
-    }
+    const fed = await feedVideo(activeClip, timelineTime);
+    const missingVideoFile = activeClip ? fed.missingVideoFile : false;
+    const videoEl = fed.videoElement;
 
     renderCompositeFrame({
       ctx,

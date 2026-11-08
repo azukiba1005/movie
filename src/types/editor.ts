@@ -76,6 +76,8 @@ export interface VideoClip {
   positionY: number;
   /** Scale multiplier (1.0 = 100% fit) */
   scale: number;
+  /** Multicam angle: 1 = Cam 1 (main), 2 = Cam 2 (sub). Audio always stays on Cam 1. Undefined = 1 */
+  cameraAngle?: 1 | 2;
 }
 
 export interface BgmClip {
@@ -171,6 +173,9 @@ export interface EditorHistorySnapshot {
 }
 
 export interface SerializedProjectJson {
+  /** Multicam: media id of Cam 2 and its offset (cam2 time = cam1 source time + cam2Offset) */
+  cam2MediaId?: string | null;
+  cam2Offset?: number;
   version: string;
   projectName: string;
   aspectRatio: AspectRatioType;

@@ -33,6 +33,8 @@ export const Inspector: React.FC = () => {
   const bgmClips = useEditorStore((s) => s.bgmClips);
   const customFonts = useEditorStore((s) => s.customFonts);
   const defaultSubtitleStyle = useEditorStore((s) => s.defaultSubtitleStyle);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const setClipCameraAngle = useEditorStore((s) => s.setClipCameraAngle);
 
   const setInspectorTab = useEditorStore((s) => s.setInspectorTab);
   const updateVideoClip = useEditorStore((s) => s.updateVideoClip);
@@ -897,6 +899,35 @@ export const Inspector: React.FC = () => {
             {/* Main Video Clip Settings */}
             {targetBgmClip ? null : targetVideoClip ? (
               <div className="space-y-3">
+                {/* Multicam Angle Card */}
+                {cam2MediaId && (
+                  <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-orange-500/30 space-y-2.5">
+                    <div className="text-xs font-bold text-zinc-100">
+                      カメラアングル（音声は常にCam 1）
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {([1, 2] as const).map((angle) => {
+                        const active = (targetVideoClip.cameraAngle ?? 1) === angle;
+                        return (
+                          <button
+                            key={angle}
+                            onClick={() => setClipCameraAngle(targetVideoClip.id, angle)}
+                            className={`py-1.5 rounded border text-xs font-bold transition ${
+                              active
+                                ? angle === 1
+                                  ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200'
+                                  : 'bg-orange-500/25 border-orange-400 text-orange-200'
+                                : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                            }`}
+                          >
+                            Cam {angle}（キー {angle}）
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {/* Playback Speed Card */}
                 <div className="p-3.5 rounded-xl bg-zinc-900/90 border border-zinc-800 space-y-3">
                   <div className="flex items-center justify-between">

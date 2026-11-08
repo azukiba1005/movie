@@ -21,6 +21,8 @@ export const ExportModal: React.FC = () => {
   const videoClips = useEditorStore((s) => s.videoClips);
   const subtitles = useEditorStore((s) => s.subtitles);
   const bgmClips = useEditorStore((s) => s.bgmClips);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const cam2Offset = useEditorStore((s) => s.cam2Offset);
 
   const setExportModalOpen = useEditorStore((s) => s.setExportModalOpen);
   const setStatusNotification = useEditorStore((s) => s.setStatusNotification);
@@ -56,6 +58,8 @@ export const ExportModal: React.FC = () => {
         videoClips,
         subtitles,
         bgmClips,
+        cam2MediaId,
+        cam2Offset,
         signal: controller.signal,
         onProgress: (pct, text) => {
           setProgress(pct);
@@ -84,6 +88,8 @@ export const ExportModal: React.FC = () => {
       videoClips,
       subtitles,
       bgmClips,
+      cam2MediaId,
+      cam2Offset,
     });
     setStatusNotification('DaVinci Resolve用 FCPXML (.fcpxml) を出力しました');
   };

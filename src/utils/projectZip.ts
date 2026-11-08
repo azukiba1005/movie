@@ -77,6 +77,8 @@ export async function exportProjectToZip(
     bgmClips: state.bgmClips,
     defaultSubtitleStyle: state.defaultSubtitleStyle,
     silenceConfig: state.silenceConfig,
+    cam2MediaId: state.cam2MediaId,
+    cam2Offset: state.cam2Offset,
     mediaMetadata,
     fontMetadata,
   };
@@ -298,6 +300,12 @@ export async function importProjectFromZip(
     defaultSubtitleStyle:
       projectData.defaultSubtitleStyle || store.defaultSubtitleStyle,
     silenceConfig: projectData.silenceConfig || store.silenceConfig,
+    cam2MediaId:
+      projectData.cam2MediaId &&
+      restoredMedia.some((m) => m.id === projectData.cam2MediaId)
+        ? projectData.cam2MediaId
+        : null,
+    cam2Offset: projectData.cam2Offset ?? 0,
   });
 
   onProgress?.(100, 'プロジェクトの読み込みが完了しました');

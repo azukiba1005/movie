@@ -88,6 +88,9 @@ export function generateFcpxmlString(params: {
   videoClips: VideoClip[];
   subtitles: SubtitleItem[];
   bgmClips: BgmClip[];
+  /** Multicam Cam 2 media id / offset (cam2 time = cam1 source time + offset) */
+  cam2MediaId?: string | null;
+  cam2Offset?: number;
 }): string {
   const {
     projectName,
@@ -96,6 +99,8 @@ export function generateFcpxmlString(params: {
     videoClips,
     subtitles,
     bgmClips,
+    cam2MediaId,
+    cam2Offset = 0,
   } = params;
 
   const { width, height } = getCanvasDimensions(aspectRatio);
@@ -153,6 +158,31 @@ export function generateFcpxmlString(params: {
       // Attach BGM and Subtitles to the first clip or primary spine
       const attachedElements: string[] = [];
 
+      // Multicam: Cam 2 angle is attached as a muted video-only clip on lane 1 so the
+      // master audio (Cam 1) stays on the spine. start = cam1 source time + cam2Offset.
+      const cam2RId = cam2MediaId ? assetIdMap.get(cam2MediaId) : undefined;
+      const cam2Asset = cam2MediaId
+        ? mediaAssets.find((m) => m.id === cam2MediaId)
+        : undefined;
+      if (clip.cameraAngle === 2 && cam2RId && cam2Asset) {
+        const cam2Start = clip.sourceStart + cam2Offset;
+        if (cam2Start >= 0) {
+          attachedElements.push(
+            `            <asset-clip name="${escapeXml(
+              cam2Asset.name
+            )} (Cam 2)" lane="1" offset="${toFcpxmlTime(
+              clip.sourceStart
+            )}" ref="${cam2RId}" start="${toFcpxmlTime(
+              cam2Start
+            )}" duration="${toFcpxmlTime(
+              clip.sourceEnd - clip.sourceStart
+            )}" audioRole="dialogue">
+              <adjust-volume amount="-96dB"/>
+            </asset-clip>`
+          );
+        }
+      }
+
       if (idx === 0) {
         // Attach BGM clips on lane -1
         for (const bgm of bgmClips) {
@@ -181,7 +211,7 @@ export function generateFcpxmlString(params: {
           attachedElements.push(
             `            <title name="Subtitle ${
               sIdx + 1
-            }" lane="1" offset="${toFcpxmlTime(
+            }" lane="2" offset="${toFcpxmlTime(
               clip.sourceStart + sub.startTime
             )}" ref="r_title" duration="${toFcpxmlTime(subDur)}" start="0s">
               <text>
@@ -245,6 +275,8 @@ export function downloadFcpxmlFile(params: {
   videoClips: VideoClip[];
   subtitles: SubtitleItem[];
   bgmClips: BgmClip[];
+  cam2MediaId?: string | null;
+  cam2Offset?: number;
 }): void {
   const xml = generateFcpxmlString(params);
   const blob = new Blob([xml], { type: 'application/xml;charset=utf-8' });

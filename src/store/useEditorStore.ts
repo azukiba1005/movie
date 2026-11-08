@@ -232,6 +232,12 @@ export interface EditorState {
   bgmClips: BgmClip[]; // Track 3 (BGM)
   defaultSubtitleStyle: SubtitleStyle;
 
+  // Multicam (Cam 1 = main + master audio, Cam 2 = sub video only)
+  cam2MediaId: string | null;
+  /** cam2 media time = cam1 media source time + cam2Offset (seconds) */
+  cam2Offset: number;
+  multicamMode: boolean;
+
   // Playback & Timeline UI state
   isPlaying: boolean;
   currentTime: number;
@@ -305,6 +311,13 @@ export interface EditorState {
   registerCustomFont: (fontAsset: CustomFontAsset) => Promise<void>;
   removeCustomFont: (fontId: string) => void;
 
+  // Multicam Actions
+  setCam2MediaId: (mediaId: string | null) => void;
+  setCam2Offset: (offset: number) => void;
+  setMulticamMode: (enabled: boolean) => void;
+  setClipCameraAngle: (clipId: string, angle: 1 | 2) => void;
+  liveSwitchAngle: (angle: 1 | 2) => void;
+
   // Video Clip Actions (Track 2)
   addVideoClipFromAsset: (mediaId: string) => void;
   updateVideoClip: (clipId: string, patch: Partial<VideoClip>, recordHistory?: boolean) => void;
@@ -358,6 +371,8 @@ export interface EditorState {
     bgmClips: BgmClip[];
     defaultSubtitleStyle: SubtitleStyle;
     silenceConfig: SilenceConfig;
+    cam2MediaId?: string | null;
+    cam2Offset?: number;
   }) => void;
 }
 
@@ -375,6 +390,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   subtitles: [],
   bgmClips: [],
   defaultSubtitleStyle: JSON.parse(JSON.stringify(DEFAULT_SUBTITLE_STYLE)),
+
+  cam2MediaId: null,
+  cam2Offset: 0,
+  multicamMode: false,
 
   isPlaying: false,
   currentTime: 0,
@@ -595,6 +614,18 @@ export const useEditorStore = create<EditorState>((set, get) => ({
           state.videoClips.filter((c) => c.mediaId !== mediaId)
         ),
         bgmClips: state.bgmClips.filter((b) => b.mediaId !== mediaId),
+        ...(state.cam2MediaId === mediaId
+          ? {
+              cam2MediaId: null,
+              cam2Offset: 0,
+              multicamMode: false,
+              videoClips: packVideoClipsRipple(
+                state.videoClips
+                  .filter((c) => c.mediaId !== mediaId)
+                  .map((c) => ({ ...c, cameraAngle: 1 as const }))
+              ),
+            }
+          : {}),
       };
     });
   },
@@ -630,6 +661,91 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     set((state) => ({
       customFonts: state.customFonts.filter((f) => f.id !== fontId),
     }));
+  },
+
+  setCam2MediaId: (cam2MediaId) => {
+    set((state) => ({
+      cam2MediaId,
+      cam2Offset: cam2MediaId ? state.cam2Offset : 0,
+      multicamMode: cam2MediaId ? state.multicamMode : false,
+      videoClips: cam2MediaId
+        ? state.videoClips
+        : state.videoClips.map((c) => ({ ...c, cameraAngle: 1 as const })),
+    }));
+  },
+
+  setCam2Offset: (offset) => {
+    const safe = Number.isFinite(offset) ? offset : 0;
+    set({ cam2Offset: Number(Math.max(-3600, Math.min(3600, safe)).toFixed(3)) });
+  },
+
+  setMulticamMode: (multicamMode) => set({ multicamMode }),
+
+  setClipCameraAngle: (clipId, angle) => {
+    const state = get();
+    if (angle === 2 && !state.cam2MediaId) {
+      state.setStatusNotification('先にCam 2（サブカメラ）を登録してください');
+      return;
+    }
+    const target = state.videoClips.find((c) => c.id === clipId);
+    if (!target || (target.cameraAngle ?? 1) === angle) return;
+    state.saveHistory();
+    set({
+      videoClips: state.videoClips.map((c) =>
+        c.id === clipId ? { ...c, cameraAngle: angle } : c
+      ),
+    });
+  },
+
+  /**
+   * Live switching: split the clip under the playhead at currentTime and switch the angle
+   * from there. The new angle also carries over to following clips until a clip that
+   * already had a different angle than the original one is reached.
+   */
+  liveSwitchAngle: (angle) => {
+    const state = get();
+    if (angle === 2 && !state.cam2MediaId) {
+      state.setStatusNotification('先にCam 2（サブカメラ）を登録してください');
+      return;
+    }
+    const t = state.currentTime;
+    const idx = state.videoClips.findIndex(
+      (c) => t >= c.startTime && t < c.startTime + c.duration
+    );
+    if (idx === -1) return;
+    const clip = state.videoClips[idx];
+    const baseAngle = clip.cameraAngle ?? 1;
+    if (baseAngle === angle) return;
+
+    state.saveHistory();
+
+    const rel = t - clip.startTime;
+    const next = [...state.videoClips];
+    let firstChanged = idx;
+
+    if (rel > 0.08 && rel < clip.duration - 0.08) {
+      const sourceSplit = Number((clip.sourceStart + rel * clip.speed).toFixed(4));
+      const first: VideoClip = {
+        ...clip,
+        sourceEnd: sourceSplit,
+        duration: Number(((sourceSplit - clip.sourceStart) / clip.speed).toFixed(4)),
+      };
+      const second: VideoClip = {
+        ...clip,
+        id: `vclip-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        sourceStart: sourceSplit,
+        duration: Number(((clip.sourceEnd - sourceSplit) / clip.speed).toFixed(4)),
+      };
+      next.splice(idx, 1, first, second);
+      firstChanged = idx + 1;
+    }
+
+    for (let i = firstChanged; i < next.length; i++) {
+      if (i > firstChanged && (next[i].cameraAngle ?? 1) !== baseAngle) break;
+      next[i] = { ...next[i], cameraAngle: angle };
+    }
+
+    set({ videoClips: packVideoClipsRipple(next) });
   },
 
   addVideoClipFromAsset: (mediaId) => {
@@ -1320,6 +1436,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       bgmClips: payload.bgmClips,
       defaultSubtitleStyle: payload.defaultSubtitleStyle,
       silenceConfig: payload.silenceConfig,
+      cam2MediaId: payload.cam2MediaId ?? null,
+      cam2Offset: payload.cam2Offset ?? 0,
+      multicamMode: false,
       currentTime: 0,
       isPlaying: false,
       selectedItemId: null,

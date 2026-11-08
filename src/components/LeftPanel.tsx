@@ -21,11 +21,13 @@ import {
   Loader2,
   AlertCircle,
   Activity,
+  Camera,
 } from 'lucide-react';
 import { useEditorStore } from '../store/useEditorStore';
 import {
   detectSilenceOnTimeline,
   encodeMonoAudioBufferToWav,
+  estimateCam2Offset,
   extractWaveformPeaks,
   probeMediaMetadata,
   renderTimelineAudioChunksForWhisper,
@@ -47,6 +49,11 @@ export const LeftPanel: React.FC = () => {
   const selectedItemId = useEditorStore((s) => s.selectedItemId);
   const appPasscode = useEditorStore((s) => s.appPasscode);
   const geminiApiKey = useEditorStore((s) => s.geminiApiKey);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const cam2Offset = useEditorStore((s) => s.cam2Offset);
+  const setCam2MediaId = useEditorStore((s) => s.setCam2MediaId);
+  const setCam2Offset = useEditorStore((s) => s.setCam2Offset);
+  const setMulticamMode = useEditorStore((s) => s.setMulticamMode);
 
   const setLeftPanelTab = useEditorStore((s) => s.setLeftPanelTab);
   const addMediaAsset = useEditorStore((s) => s.addMediaAsset);
@@ -90,6 +97,9 @@ export const LeftPanel: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const relinkInputRef = useRef<HTMLInputElement | null>(null);
+  const cam2InputRef = useRef<HTMLInputElement | null>(null);
+  const [isSyncingCam, setIsSyncingCam] = useState(false);
+  const [syncInfo, setSyncInfo] = useState<string | null>(null);
 
   // Process uploaded files (Video, BGM Audio, or Custom Font .ttf/.otf/.woff2)
   const handleFilesSelected = async (fileList: FileList | File[]) => {
@@ -304,7 +314,12 @@ export const LeftPanel: React.FC = () => {
     try {
       for (const asset of videoAssets) {
         if (!asset.file) continue;
-        await analyzeAssetInBackground(asset.id, asset.file, 50, true);
+        await analyzeAssetInBackground(
+          asset.id,
+          asset.file,
+          50,
+          asset.id !== useEditorStore.getState().cam2MediaId
+        );
       }
     } finally {
       setIsReanalyzingAudio(false);
@@ -420,6 +435,90 @@ export const LeftPanel: React.FC = () => {
     } finally {
       setIsLoadingFiles(false);
     }
+  };
+
+  // Register Cam 2 (sub camera, video only — audio always comes from Cam 1)
+  const handleCam2Selected = async (file: File) => {
+    setSyncInfo(null);
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const meta = await probeMediaMetadata(objectUrl, 'video');
+      const prev = useEditorStore.getState().cam2MediaId;
+      if (prev) removeMediaAsset(prev);
+      const assetId = `media-c2-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      const asset: MediaAsset = {
+        id: assetId,
+        name: file.name,
+        type: 'video',
+        file,
+        objectUrl,
+        duration: meta.duration,
+        width: meta.width,
+        height: meta.height,
+        sizeBytes: file.size,
+        mimeType: file.type || 'video/mp4',
+        waveformPeaks: [],
+        rawWaveformRms: [],
+        waveformSampleRate: 50,
+        audioAnalyzing: true,
+        audioAnalysisProgress: 0,
+      };
+      addMediaAsset(asset, false);
+      setCam2MediaId(assetId);
+      setCam2Offset(0);
+      setStatusNotification(
+        `Cam 2「${file.name}」を登録しました。「音声波形から自動同期」を実行してください`
+      );
+      void analyzeAssetInBackground(assetId, file, 50, false);
+    } catch (err) {
+      URL.revokeObjectURL(objectUrl);
+      setStatusNotification(
+        `Cam 2を読み込めませんでした: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  };
+
+  // Auto sync Cam 2 to Cam 1 by cross-correlating audio envelopes
+  const handleAutoSyncCam2 = () => {
+    const state = useEditorStore.getState();
+    const cam1Id =
+      state.videoClips[0]?.mediaId ||
+      state.mediaAssets.find(
+        (m) => m.type === 'video' && m.id !== state.cam2MediaId
+      )?.id;
+    const cam1 = state.mediaAssets.find((m) => m.id === cam1Id);
+    const cam2 = state.mediaAssets.find((m) => m.id === state.cam2MediaId);
+    if (!cam1 || !cam2) {
+      setStatusNotification('Cam 1（メイン動画）とCam 2の両方を登録してください');
+      return;
+    }
+    setIsSyncingCam(true);
+    setSyncInfo(null);
+    // Let the spinner render before the (synchronous) correlation runs
+    setTimeout(() => {
+      try {
+        const result = estimateCam2Offset(cam1, cam2, 120, 90);
+        setCam2Offset(result.offsetSec);
+        setSyncInfo(
+          `同期完了: ${result.offsetSec >= 0 ? '+' : ''}${result.offsetSec.toFixed(
+            3
+          )}秒（一致度 ${Math.round(result.confidence * 100)}%）`
+        );
+        setStatusNotification(
+          `Cam 2を自動同期しました（オフセット ${result.offsetSec.toFixed(3)}秒）`
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setSyncInfo(msg);
+        setStatusNotification(`自動同期エラー: ${msg}`);
+      } finally {
+        setIsSyncingCam(false);
+      }
+    }, 30);
   };
 
   // Run Silence Detection on Track 2
@@ -630,7 +729,10 @@ export const LeftPanel: React.FC = () => {
   };
 
   const selectedCutCount = cutIntervals.filter((c) => c.selected).length;
-  const primaryVideoAsset = mediaAssets.find((m) => m.type === 'video');
+  const primaryVideoAsset = mediaAssets.find(
+    (m) => m.type === 'video' && m.id !== cam2MediaId
+  );
+  const cam2Asset = mediaAssets.find((m) => m.id === cam2MediaId);
 
   // Live preview: how many spots / total seconds would be cut with the current slider values
   const silencePreview = useMemo(() => {
@@ -680,6 +782,17 @@ export const LeftPanel: React.FC = () => {
         onChange={(e) => {
           if (e.target.files) handleFilesSelected(e.target.files);
           e.target.value = '';
+        }}
+        className="hidden"
+      />
+      <input
+        ref={cam2InputRef}
+        type="file"
+        accept="video/*,.mp4,.mov,.webm"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = '';
+          if (file) void handleCam2Selected(file);
         }}
         className="hidden"
       />
@@ -833,6 +946,11 @@ export const LeftPanel: React.FC = () => {
                         </div>
                         <div className="min-w-0">
                           <div className="text-xs font-medium text-zinc-200 truncate">
+                            {asset.id === cam2MediaId && (
+                              <span className="mr-1.5 px-1 rounded bg-orange-500/20 text-orange-300 text-[10px] font-bold">
+                                Cam 2
+                              </span>
+                            )}
                             {asset.name}
                           </div>
                           <div className="text-[11px] text-zinc-400 flex items-center gap-2 font-mono">
@@ -865,17 +983,19 @@ export const LeftPanel: React.FC = () => {
                             <span>再選択</span>
                           </button>
                         )}
-                        <button
-                          onClick={() =>
-                            asset.type === 'video'
-                              ? addVideoClipFromAsset(asset.id)
-                              : addBgmClipFromAsset(asset.id)
-                          }
-                          title="タイムライン末尾に追加"
-                          className="p-1.5 rounded bg-zinc-800 hover:bg-cyan-500/20 text-zinc-300 hover:text-cyan-300 transition"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                        </button>
+                        {asset.id !== cam2MediaId && (
+                          <button
+                            onClick={() =>
+                              asset.type === 'video'
+                                ? addVideoClipFromAsset(asset.id)
+                                : addBgmClipFromAsset(asset.id)
+                            }
+                            title="タイムライン末尾に追加"
+                            className="p-1.5 rounded bg-zinc-800 hover:bg-cyan-500/20 text-zinc-300 hover:text-cyan-300 transition"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         <button
                           onClick={() => removeMediaAsset(asset.id)}
                           title="素材を削除"
@@ -888,6 +1008,116 @@ export const LeftPanel: React.FC = () => {
                   ))}
                 </div>
               )}
+            </div>
+
+            {/* Multicam (2-camera) */}
+            <div className="p-3 rounded-xl bg-zinc-900/90 border border-orange-500/30 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-bold text-zinc-100 flex items-center gap-1.5">
+                  <Camera className="w-4 h-4 text-orange-400" />
+                  <span>マルチカム（2カメ）</span>
+                </div>
+                <button
+                  onClick={() => cam2InputRef.current?.click()}
+                  className="px-2 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 border border-orange-500/40 text-[11px] flex items-center gap-1"
+                >
+                  <Upload className="w-3 h-3" />
+                  <span>{cam2Asset ? 'Cam 2を差し替え' : 'Cam 2を登録'}</span>
+                </button>
+              </div>
+              <p className="text-[11px] text-zinc-400 leading-relaxed">
+                Cam 1＝メイン映像＋マスター音声。Cam 2は映像のみ使用し、音声・無音カット・文字起こしは常にCam 1です。
+              </p>
+
+              {cam2Asset ? (
+                <>
+                  <div className="text-[11px] text-zinc-300 truncate">
+                    Cam 2: {cam2Asset.name}
+                    {cam2Asset.audioAnalyzing && (
+                      <span className="ml-2 text-amber-400">音声解析中…</span>
+                    )}
+                    {cam2Asset.audioDecodeError && (
+                      <span className="ml-2 text-rose-400">音声解析失敗</span>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleAutoSyncCam2}
+                    disabled={isSyncingCam || Boolean(cam2Asset.audioAnalyzing)}
+                    className="w-full py-1.5 rounded-lg bg-gradient-to-r from-orange-500/25 to-amber-500/25 hover:from-orange-500/35 hover:to-amber-500/35 disabled:opacity-50 text-orange-200 border border-orange-500/40 font-bold text-xs flex items-center justify-center gap-1.5 transition"
+                  >
+                    {isSyncingCam ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Activity className="w-3.5 h-3.5" />
+                    )}
+                    <span>音声波形から自動同期</span>
+                  </button>
+                  {syncInfo && (
+                    <div className="text-[11px] text-amber-300 leading-relaxed">
+                      {syncInfo}
+                    </div>
+                  )}
+
+                  <div>
+                    <div className="flex items-center justify-between text-[11px] mb-1">
+                      <span className="text-zinc-400">同期オフセット（微調整）</span>
+                      <div className="flex items-center gap-1">
+                        <input
+                          type="number"
+                          step={0.001}
+                          value={cam2Offset}
+                          onChange={(e) => setCam2Offset(Number(e.target.value))}
+                          className="w-20 px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-700 text-[11px] font-mono text-orange-300 text-right"
+                        />
+                        <span className="text-zinc-500">秒</span>
+                      </div>
+                    </div>
+                    <input
+                      type="range"
+                      min={-30}
+                      max={30}
+                      step={0.01}
+                      value={Math.max(-30, Math.min(30, cam2Offset))}
+                      onChange={(e) => setCam2Offset(Number(e.target.value))}
+                      className="w-full accent-orange-500 h-1.5 bg-zinc-800 rounded-lg"
+                    />
+                    <div className="flex items-center justify-between mt-1">
+                      <div className="flex gap-1 text-[10px] font-mono">
+                        {[-0.1, -0.01, 0.01, 0.1].map((d) => (
+                          <button
+                            key={d}
+                            onClick={() => setCam2Offset(cam2Offset + d)}
+                            className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                          >
+                            {d > 0 ? '+' : ''}
+                            {d}
+                          </button>
+                        ))}
+                      </div>
+                      <span className="text-[11px] font-mono text-orange-300">
+                        {cam2Offset >= 0 ? '+' : ''}
+                        {cam2Offset.toFixed(3)}s
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-1.5">
+                    <button
+                      onClick={() => setMulticamMode(true)}
+                      className="flex-1 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-200"
+                    >
+                      マルチカムモニターを開く
+                    </button>
+                    <button
+                      onClick={() => setCam2MediaId(null)}
+                      className="px-2 py-1 rounded bg-zinc-800 hover:bg-rose-500/20 text-[11px] text-zinc-400 hover:text-rose-300"
+                      title="Cam 2の登録を解除（全クリップをCam 1に戻します）"
+                    >
+                      解除
+                    </button>
+                  </div>
+                </>
+              ) : null}
             </div>
 
             {/* Custom Fonts List */}

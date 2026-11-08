@@ -374,3 +374,37 @@ export function renderCompositeFrame(params: {
   }
 }
 
+
+/**
+ * Draw a single camera feed (letterboxed, no subtitles) for the multicam monitor tiles.
+ */
+export function renderCameraMonitorFrame(params: {
+  ctx: CanvasRenderingContext2D;
+  width: number;
+  height: number;
+  videoElement: HTMLVideoElement | null;
+  placeholder?: string;
+}): void {
+  const { ctx, width, height, videoElement, placeholder } = params;
+  ctx.fillStyle = '#09090b';
+  ctx.fillRect(0, 0, width, height);
+  if (
+    videoElement &&
+    videoElement.readyState >= 2 &&
+    videoElement.videoWidth > 0
+  ) {
+    const scale = Math.min(
+      width / videoElement.videoWidth,
+      height / videoElement.videoHeight
+    );
+    const w = videoElement.videoWidth * scale;
+    const h = videoElement.videoHeight * scale;
+    ctx.drawImage(videoElement, (width - w) / 2, (height - h) / 2, w, h);
+  } else if (placeholder) {
+    ctx.fillStyle = '#71717a';
+    ctx.font = '600 20px "Noto Sans JP", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(placeholder, width / 2, height / 2);
+  }
+}

@@ -9,10 +9,13 @@ import {
   Repeat,
   ShieldAlert,
   Maximize2,
+  MonitorPlay,
+  LayoutGrid,
 } from 'lucide-react';
 import { useEditorStore } from '../store/useEditorStore';
 import {
   getCanvasDimensions,
+  renderCameraMonitorFrame,
   renderCompositeFrame,
 } from '../utils/canvasRenderer';
 
@@ -42,7 +45,12 @@ export const PreviewPlayer: React.FC = () => {
   const cutIntervals = useEditorStore((s) => s.cutIntervals);
   const selectedItemId = useEditorStore((s) => s.selectedItemId);
   const selectedItemType = useEditorStore((s) => s.selectedItemType);
+  const cam2MediaId = useEditorStore((s) => s.cam2MediaId);
+  const cam2Offset = useEditorStore((s) => s.cam2Offset);
+  const multicamMode = useEditorStore((s) => s.multicamMode);
 
+  const setMulticamMode = useEditorStore((s) => s.setMulticamMode);
+  const liveSwitchAngle = useEditorStore((s) => s.liveSwitchAngle);
   const setIsPlaying = useEditorStore((s) => s.setIsPlaying);
   const setCurrentTime = useEditorStore((s) => s.setCurrentTime);
   const setLoopPlayback = useEditorStore((s) => s.setLoopPlayback);
@@ -53,6 +61,10 @@ export const PreviewPlayer: React.FC = () => {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cam2Ref = useRef<HTMLVideoElement | null>(null);
+  const activeCam2UrlRef = useRef<string>('');
+  const cam1MonitorRef = useRef<HTMLCanvasElement | null>(null);
+  const cam2MonitorRef = useRef<HTMLCanvasElement | null>(null);
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
   const activeVideoUrlRef = useRef<string>('');
   const activeBgmUrlRef = useRef<string>('');
@@ -150,6 +162,56 @@ export const PreviewPlayer: React.FC = () => {
         }
       }
 
+      // Sync Cam 2 element (video only, ALWAYS muted: Cam 1 is the master audio)
+      const cam2El = cam2Ref.current;
+      if (cam2El) {
+        cam2El.muted = true;
+        const asset2 = cam2MediaId
+          ? mediaAssets.find((m) => m.id === cam2MediaId)
+          : undefined;
+        const needCam2 = Boolean(
+          activeClip &&
+            asset2 &&
+            asset2.objectUrl &&
+            !asset2.missingFile &&
+            (multicamMode || activeClip.cameraAngle === 2)
+        );
+        if (needCam2 && activeClip && asset2) {
+          if (activeCam2UrlRef.current !== asset2.objectUrl) {
+            activeCam2UrlRef.current = asset2.objectUrl;
+            cam2El.src = asset2.objectUrl;
+            cam2El.load();
+          }
+          const t2 =
+            activeClip.sourceStart +
+            (timelineTime - activeClip.startTime) * activeClip.speed +
+            cam2Offset;
+          const rate2 = Math.max(0.25, Math.min(4.0, activeClip.speed));
+          if (Math.abs(cam2El.playbackRate - rate2) > 0.01) {
+            cam2El.playbackRate = rate2;
+          }
+          if (t2 < 0 || t2 >= asset2.duration) {
+            if (!cam2El.paused) cam2El.pause();
+          } else {
+            const drift2 = playing ? 0.22 * rate2 : 0.03;
+            if (Math.abs(cam2El.currentTime - t2) > drift2) {
+              try {
+                cam2El.currentTime = Math.max(0, t2);
+              } catch {
+                // metadata not ready yet
+              }
+            }
+            if (playing && cam2El.paused && cam2El.readyState >= 2) {
+              cam2El.play().catch(() => {});
+            } else if (!playing && !cam2El.paused) {
+              cam2El.pause();
+            }
+          }
+        } else if (!cam2El.paused) {
+          cam2El.pause();
+        }
+      }
+
       // Sync BGM audio element
       const bgmEl = bgmAudioRef.current;
       const activeBgm = getActiveBgmAt(timelineTime);
@@ -203,7 +265,14 @@ export const PreviewPlayer: React.FC = () => {
         }
       }
     },
-    [getActiveClipAt, getActiveBgmAt, mediaAssets]
+    [
+      getActiveClipAt,
+      getActiveBgmAt,
+      mediaAssets,
+      cam2MediaId,
+      cam2Offset,
+      multicamMode,
+    ]
   );
 
   // Draw current composite frame to Canvas
@@ -219,6 +288,24 @@ export const PreviewPlayer: React.FC = () => {
         ? mediaAssets.find((m) => m.id === activeClip.mediaId)
         : undefined;
 
+      // Pick the program video element by cameraAngle (fallback to Cam 1 when Cam 2 can't show a frame)
+      const cam1El = videoRef.current;
+      const cam2El = cam2Ref.current;
+      const asset2 = cam2MediaId
+        ? mediaAssets.find((m) => m.id === cam2MediaId)
+        : undefined;
+      let cam2Usable = false;
+      if (activeClip && cam2El && asset2 && !asset2.missingFile) {
+        const t2 =
+          activeClip.sourceStart +
+          (t - activeClip.startTime) * activeClip.speed +
+          cam2Offset;
+        cam2Usable =
+          t2 >= 0 && t2 < asset2.duration && cam2El.readyState >= 2;
+      }
+      const programVideo =
+        activeClip?.cameraAngle === 2 && cam2Usable ? cam2El : cam1El;
+
       renderCompositeFrame({
         ctx,
         canvasWidth,
@@ -226,11 +313,34 @@ export const PreviewPlayer: React.FC = () => {
         aspectRatio,
         timelineTime: t,
         activeClip,
-        videoElement: videoRef.current,
+        videoElement: programVideo,
         subtitles,
         showSafeZone,
         missingVideoFile: Boolean(asset?.missingFile),
       });
+
+      if (multicamMode) {
+        const c1 = cam1MonitorRef.current?.getContext('2d');
+        if (c1 && cam1MonitorRef.current) {
+          renderCameraMonitorFrame({
+            ctx: c1,
+            width: cam1MonitorRef.current.width,
+            height: cam1MonitorRef.current.height,
+            videoElement: activeClip ? cam1El : null,
+            placeholder: 'Cam 1',
+          });
+        }
+        const c2 = cam2MonitorRef.current?.getContext('2d');
+        if (c2 && cam2MonitorRef.current) {
+          renderCameraMonitorFrame({
+            ctx: c2,
+            width: cam2MonitorRef.current.width,
+            height: cam2MonitorRef.current.height,
+            videoElement: cam2Usable ? cam2El : null,
+            placeholder: cam2MediaId ? 'Cam 2（範囲外）' : 'Cam 2 未登録',
+          });
+        }
+      }
     },
     [
       canvasWidth,
@@ -240,6 +350,9 @@ export const PreviewPlayer: React.FC = () => {
       mediaAssets,
       subtitles,
       showSafeZone,
+      cam2MediaId,
+      cam2Offset,
+      multicamMode,
     ]
   );
 
@@ -349,6 +462,14 @@ export const PreviewPlayer: React.FC = () => {
         preload="auto"
         crossOrigin="anonymous"
       />
+      <video
+        ref={cam2Ref}
+        className="hidden"
+        playsInline
+        muted
+        preload="auto"
+        crossOrigin="anonymous"
+      />
       <audio ref={bgmAudioRef} className="hidden" preload="auto" />
 
       {/* Top Monitor Status Bar */}
@@ -373,6 +494,41 @@ export const PreviewPlayer: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-1.5">
+          <div className="flex items-center rounded border border-zinc-700 overflow-hidden">
+            <button
+              onClick={() => setMulticamMode(false)}
+              className={`px-2 py-0.5 text-[11px] flex items-center gap-1 transition ${
+                !multicamMode
+                  ? 'bg-cyan-500/20 text-cyan-300'
+                  : 'text-zinc-400 hover:bg-zinc-800'
+              }`}
+            >
+              <MonitorPlay className="w-3.5 h-3.5" />
+              <span>通常プレビュー</span>
+            </button>
+            <button
+              onClick={() => {
+                if (!cam2MediaId) {
+                  useEditorStore
+                    .getState()
+                    .setStatusNotification(
+                      '左パネル「素材」タブでCam 2を登録してください'
+                    );
+                  return;
+                }
+                setMulticamMode(true);
+              }}
+              title="Cam 1 / Cam 2 の2分割モニター + プログラム出力（キー 1 / 2 でライブスイッチング）"
+              className={`px-2 py-0.5 text-[11px] flex items-center gap-1 transition ${
+                multicamMode
+                  ? 'bg-orange-500/20 text-orange-300'
+                  : 'text-zinc-400 hover:bg-zinc-800'
+              }`}
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+              <span>マルチカム (2画面)</span>
+            </button>
+          </div>
           <button
             onClick={() => setShowSafeZone(!showSafeZone)}
             title="YouTube / ショート セーフゾーン枠の表示切替"
@@ -390,10 +546,51 @@ export const PreviewPlayer: React.FC = () => {
 
       {/* Center Canvas Viewport */}
       <div
-        className="flex-1 relative flex items-center justify-center p-3 overflow-hidden bg-[#0e0e11]"
+        className="flex-1 relative flex items-center justify-center gap-3 p-3 overflow-hidden bg-[#0e0e11]"
         onMouseUp={handleCanvasMouseUp}
         onMouseLeave={handleCanvasMouseUp}
       >
+        {multicamMode && cam2MediaId && (
+          <div className="w-[36%] max-w-[360px] h-full flex flex-col justify-center gap-2 shrink-0">
+            {([1, 2] as const).map((angle) => {
+              const isLive = (activeClip?.cameraAngle ?? 1) === angle;
+              return (
+                <div
+                  key={angle}
+                  onClick={() => liveSwitchAngle(angle)}
+                  title={`クリックで Cam ${angle} に切替（キー ${angle}）`}
+                  className={`relative aspect-video w-full rounded-md overflow-hidden bg-black cursor-pointer border-2 transition ${
+                    isLive
+                      ? 'border-rose-500 shadow-[0_0_12px_rgba(244,63,94,0.5)]'
+                      : 'border-zinc-700 hover:border-zinc-500'
+                  }`}
+                >
+                  <canvas
+                    ref={angle === 1 ? cam1MonitorRef : cam2MonitorRef}
+                    width={640}
+                    height={360}
+                    className="w-full h-full block"
+                  />
+                  <span
+                    className={`absolute top-1 left-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                      angle === 1
+                        ? 'bg-cyan-500/80 text-zinc-950'
+                        : 'bg-orange-500/90 text-zinc-950'
+                    }`}
+                  >
+                    Cam {angle} <span className="opacity-70">[{angle}]</span>
+                  </span>
+                  {isLive && (
+                    <span className="absolute top-1 right-1 px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold animate-pulse">
+                      ● LIVE
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div className="flex-1 min-w-0 h-full flex items-center justify-center">
         <div
           className={`relative flex items-center justify-center shadow-2xl ring-1 ring-zinc-800 bg-black overflow-hidden ${
             aspectRatio === '16:9'
@@ -421,6 +618,7 @@ export const PreviewPlayer: React.FC = () => {
               </p>
             </div>
           )}
+        </div>
         </div>
       </div>
 
